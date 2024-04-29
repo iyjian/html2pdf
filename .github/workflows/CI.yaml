@@ -33,4 +33,4 @@ jobs:
       with:
         context: .
         push: true
-        tags: iyjian/pdf2html:latest
+        tags: iyjian/html2pdf:latest
