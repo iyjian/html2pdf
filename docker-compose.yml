@@ -1,0 +1,12 @@
+version: "3.5"
+
+services:
+  snapshot:
+    build: .
+    image: iyjian/snapshot
+    env_file:
+      - .env
+    restart: always
+    ports:
+      - "3000:3000"
+    command: "yarn run start:prod"
