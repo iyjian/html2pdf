@@ -34,3 +34,4 @@ jobs:
         context: .
         push: true
         tags: iyjian/html2pdf:latest
+    - run: curl --data-urlencode "content=image html2pdf build successfully" https://h.tltr.top/g/OrvXSVI
