@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, Post, Res } from '@nestjs/common';
 import { SnapshotService } from './snapshot.service';
 import { Response } from 'express';
+import { PDFOptions } from 'puppeteer';
 
 @Controller('snapshot')
 export class SnapshotController {
@@ -10,11 +11,12 @@ export class SnapshotController {
   async toPDF(
     @Body('content') content: string,
     @Body('fileName') fileName: string = 'download.pdf',
+    @Body('pdfOption') pdfOption: PDFOptions,
     @Res() res: Response,
   ) {
     res.set('Content-Type', 'application/x-pdf');
     res.set('Content-Disposition', `attachment;filename=${fileName}`);
-    const result = await this.snapshotService.toPDF(content);
+    const result = await this.snapshotService.toPDF(content, pdfOption);
     res.send(result);
     return true;
   }

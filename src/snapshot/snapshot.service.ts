@@ -6,7 +6,7 @@ import {
   Scope,
 } from '@nestjs/common';
 import puppeteer from 'puppeteer-extra';
-import { Browser, Page, KnownDevices } from 'puppeteer';
+import { Browser, Page, KnownDevices, PDFOptions } from 'puppeteer';
 
 /**
  * 常用分辨率
@@ -66,7 +66,7 @@ export class SnapshotService {
     }
   }
 
-  async toPDF(content: string): Promise<Buffer> {
+  async toPDF(content: string, pdfOption?: PDFOptions): Promise<Buffer> {
     try {
       await this.init();
 
@@ -78,6 +78,7 @@ export class SnapshotService {
       const pdfBuffer = await this.page.pdf({
         format: 'A4',
         printBackground: true,
+        ...pdfOption,
       });
 
       return pdfBuffer;
