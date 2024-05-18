@@ -53,6 +53,8 @@ export class SnapshotService {
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
+          // https://stackoverflow.com/questions/48297515/puppeteer-chromium-handle-crashing-memory-heavy-pages
+          '--disable-dev-shm-usage',
           '--lang=zh',
           '--single-process',
           '--no-zygote',
@@ -92,8 +94,10 @@ export class SnapshotService {
         const pages = await this.browser.pages();
         for (const page of pages) {
           await page.close();
+          this.logger.debug(`toPDF - close page`);
         }
         await this.browser.close();
+        this.logger.debug(`toPDF - close browser`);
       }
     }
   }
