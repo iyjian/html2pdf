@@ -15,7 +15,7 @@ import { ThrottlerGuardV2 } from './core/guards/throttle.guard';
     }),
     ThrottlerModule.forRoot({
       ttl: 3600,
-      limit: 20,
+      limit: 180,
     }),
     SnapshotModule,
   ],
