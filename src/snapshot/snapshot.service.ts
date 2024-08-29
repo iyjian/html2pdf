@@ -103,6 +103,7 @@ export class SnapshotService {
   }
 
   async URL2PDF(url: string, pdfOption?: PDFOptions): Promise<Buffer> {
+    console.log(url, pdfOption)
     try {
       await this.init();
 
