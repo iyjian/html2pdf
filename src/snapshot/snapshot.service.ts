@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import puppeteer from 'puppeteer-extra';
 import { Browser, Page, KnownDevices, PDFOptions } from 'puppeteer';
-
+import { SnapshotOptionDto } from './../core/interfaces/requestDto';
 /**
  * 常用分辨率
  * https://gs.statcounter.com/screen-resolution-stats/desktop/worldwide
@@ -98,6 +98,121 @@ export class SnapshotService {
         }
         await this.browser.close();
         this.logger.debug(`toPDF - close browser`);
+      }
+    }
+  }
+
+  async URL2PDF(url: string, pdfOption?: PDFOptions): Promise<Buffer> {
+    try {
+      await this.init();
+
+      this.page = (await this.browser.pages())[0];
+
+      await this.page.goto(url, {
+        timeout: 100000,
+        /**
+         * "load"|"domcontentloaded"|"networkidle0"|"networkidle2"
+         */
+        waitUntil: ['networkidle2'],
+      });
+
+      await this.waitPageLoaded(this.page, {
+        scrollTimes: 2,
+        scrollDelay: 100,
+        scrollOffset: 10,
+      });
+
+      // 配置PDF选项
+      const pdfBuffer = await this.page.pdf({
+        format: 'A4',
+        // printBackground: true,
+        ...pdfOption,
+      });
+
+      return pdfBuffer;
+    } catch (e) {
+      console.log(e);
+      throw new HttpException(
+        '系统错误：未能生成PDF',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    } finally {
+      if (this.browser && this.browser.isConnected()) {
+        const pages = await this.browser.pages();
+        for (const page of pages) {
+          await page.close();
+          this.logger.debug(`toPDF - close page`);
+        }
+        await this.browser.close();
+        this.logger.debug(`toPDF - close browser`);
+      }
+    }
+  }
+
+  private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
+    /**
+     * 等待中的请求
+     */
+    const waitingRequests = {
+      /**
+       * url: isCompleted
+       */
+    };
+
+    await page.setRequestInterception(true);
+
+    /**
+     * 注册请求的监听
+     */
+    page.on('request', (request) => {
+      //  this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - request url: ${request.url()}`)
+      if (!(request.url() in waitingRequests)) {
+        waitingRequests[request.url()] = false;
+      }
+      request.continue();
+    });
+
+    /**
+     * 注册response的监听
+     */
+    page.on('response', (response) => {
+      const requestUrl = response.request().url();
+      waitingRequests[requestUrl] = true;
+      // if (requestUrl === 'data:image/gif;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==') {
+      //   this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - url ${requestUrl} has done.`)
+      // }
+    });
+
+    /**
+     * 尝试向下滚动页面
+     */
+    for (let i = 1; i <= options.scrollTimes; i++) {
+      await this.page.mouse.wheel({
+        deltaY: parseInt(options.scrollOffset.toString()) || 1000,
+      });
+
+      // this.logger.verbose(
+      //   `taskeSnapshot - screenshot: ${screenshotId} - scroll down and delay: ${options.scrollDelay} seconds`,
+      // );
+
+      await this.page.waitForTimeout(options.scrollDelay);
+
+      for (const requestURL in waitingRequests) {
+        if (!waitingRequests[requestURL]) {
+          // this.logger.log(
+          //   `taskeSnapshot - screenshot: ${screenshotId} - waiting for ${requestURL}`,
+          // );
+
+          await this.page.waitForResponse((response) => {
+            return response.url() === requestURL && response.status() > 0;
+          });
+
+          // this.logger.log(
+          //   `taskeSnapshot - screenshot: ${screenshotId} - ${requestURL} response completed`,
+          // );
+
+          waitingRequests['requestURL'] = true;
+        }
       }
     }
   }

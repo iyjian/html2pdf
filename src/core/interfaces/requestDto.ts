@@ -1,7 +1,7 @@
 import { PuppeteerLifeCycleEvent } from 'puppeteer-core';
 
 export interface SnapshotOptionDto {
-  url: string;
+  // url: string;
   device?: string;
   resolution?: string;
   scrollTimes?: number;
@@ -10,5 +10,5 @@ export interface SnapshotOptionDto {
   pageTimeout?: number;
   scrollOffset?: number;
   debug?: boolean;
-  uploadToOss: string;
+  // uploadToOss: string;
 }
