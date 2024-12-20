@@ -114,7 +114,7 @@ export class SnapshotService {
         /**
          * "load"|"domcontentloaded"|"networkidle0"|"networkidle2"
          */
-        waitUntil: ['networkidle2'],
+        waitUntil: ['networkidle0'],
       });
 
       await this.waitPageLoaded(this.page, {
