@@ -43,7 +43,7 @@ export class SnapshotService {
       // puppeteer.use(StealthPlugin());
 
       this.browser = await puppeteer.launch({
-        headless: false,
+        headless: 'new',
         devtools: debug,
         /**
          * 语言设置
