@@ -5,6 +5,7 @@ export interface SnapshotOptionDto {
   device?: string;
   resolution?: string;
   scrollTimes?: number;
+  minScrollTimes?: number;
   scrollDelay?: number;
   readyState?: PuppeteerLifeCycleEvent;
   pageTimeout?: number;
