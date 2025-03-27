@@ -9,7 +9,7 @@ ENV NODE_ENV development
 # RUN sed -i s@http://security.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
 # RUN sed -i s@http://deb.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
 
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.14.4
 
 RUN apt-get update -y
 
