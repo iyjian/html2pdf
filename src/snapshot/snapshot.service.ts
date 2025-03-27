@@ -43,7 +43,7 @@ export class SnapshotService {
       // puppeteer.use(StealthPlugin());
 
       this.browser = await puppeteer.launch({
-        headless: 'new',
+        headless: false,
         devtools: debug,
         /**
          * 语言设置
@@ -108,7 +108,6 @@ export class SnapshotService {
       await this.init();
 
       this.page = (await this.browser.pages())[0];
-
       await this.page.goto(url, {
         timeout: 100000,
         /**
@@ -118,9 +117,9 @@ export class SnapshotService {
       });
 
       await this.waitPageLoaded(this.page, {
-        scrollTimes: 2,
-        scrollDelay: 100,
-        scrollOffset: 10,
+        scrollTimes: 20,
+        scrollDelay: 1000,
+        scrollOffset: 1000,
       });
 
       // 配置PDF选项
@@ -184,37 +183,41 @@ export class SnapshotService {
       // }
     });
 
-    /**
-     * 尝试向下滚动页面
-     */
-    for (let i = 1; i <= options.scrollTimes; i++) {
-      await this.page.mouse.wheel({
-        deltaY: parseInt(options.scrollOffset.toString()) || 1000,
-      });
+    const maxScrollTimes = options?.scrollTimes || 20;
+    const minScrollTimes = options?.minScrollTimes || 5;
+    const scrollDelay = options?.scrollDelay || 1000;
+    const scrollOffset = parseInt(options?.scrollOffset?.toString()) || 1000;
+      // 获取初始页面高度
+    let previousHeight = await page.evaluate(() => Math.max(
+        document.body.scrollHeight,
+        document.body.offsetHeight,
+        document.documentElement.clientHeight,
+        document.documentElement.scrollHeight,
+        document.documentElement.offsetHeight
+    ));
+    let scrollCount = 0;
+    let heightChanged = true;
+    while (scrollCount < maxScrollTimes && heightChanged) {
+      // 执行滚动
+      await page.mouse.wheel({ deltaY: scrollOffset });
 
-      // this.logger.verbose(
-      //   `taskeSnapshot - screenshot: ${screenshotId} - scroll down and delay: ${options.scrollDelay} seconds`,
-      // );
+      await page.waitForTimeout(scrollDelay);
+      // 获取新的页面高度
+      const currentHeight = await page.evaluate(() => Math.max(
+          document.body.scrollHeight,
+          document.body.offsetHeight,
+          document.documentElement.clientHeight,
+          document.documentElement.scrollHeight,
+          document.documentElement.offsetHeight
+      ));
 
-      await this.page.waitForTimeout(options.scrollDelay);
-
-      for (const requestURL in waitingRequests) {
-        if (!waitingRequests[requestURL]) {
-          // this.logger.log(
-          //   `taskeSnapshot - screenshot: ${screenshotId} - waiting for ${requestURL}`,
-          // );
-
-          await this.page.waitForResponse((response) => {
-            return response.url() === requestURL && response.status() > 0;
-          });
-
-          // this.logger.log(
-          //   `taskeSnapshot - screenshot: ${screenshotId} - ${requestURL} response completed`,
-          // );
-
-          waitingRequests['requestURL'] = true;
-        }
+      // 检查高度是否变化
+      if (currentHeight === previousHeight && scrollCount > minScrollTimes) {
+          heightChanged = false;
+      } else {
+          previousHeight = currentHeight;
+          scrollCount++;
       }
-    }
+  }
   }
 }

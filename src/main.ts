@@ -11,6 +11,7 @@ async function bootstrap() {
     origin: '*',
     credentials: true,
   });
+  app.setGlobalPrefix(process.env.BASE_URL)
 
   app.useGlobalFilters(new AllExceptionFilter())
 
