@@ -185,51 +185,47 @@ export class SnapshotService {
   ): Promise<UrlPdfItem> {
     try {
       await this.init();
-      const queue = [];
+      const page = await this.browser.newPage();
+      const res: UrlPdfItem[] = [];
 
       for (const [index, item] of config.entries()) {
-        queue.push(async () => {
-          const page = await this.browser.newPage();
+        await page.goto(item.url, {
+          timeout: 60 * 1000,
+          waitUntil: ['networkidle0'],
+        });
 
-          await page.goto(item.url, {
-            timeout: 60 * 1000,
-            waitUntil: ['networkidle0'],
-          });
+        await this.waitPageLoaded(page, {
+          scrollTimes: 15,
+          scrollDelay: 500,
+          scrollOffset: 1000,
+        });
 
-          await this.waitPageLoaded(page, {
-            scrollTimes: 15,
-            scrollDelay: 500,
-            scrollOffset: 1000,
-          });
+        const bodyHeight = await page.evaluate(() => {
+          return document.documentElement.scrollHeight;
+        });
 
-          const bodyHeight = await page.evaluate(() => {
-            return document.documentElement.scrollHeight;
-          });
+        const pdfConfig = {
+          printBackground: true,
+          ...item.option,
+        };
+        if (bodyHeight > 14000) {
+          pdfConfig.format = 'A4';
+        } else {
+          pdfConfig.height = `${bodyHeight}px`;
+        }
+        const pdfBuffer = await page.pdf({
+          ...pdfConfig,
+          ...item.option,
+        });
 
-          const pdfConfig = {
-            printBackground: true,
-            ...item.option,
-          };
-          if (bodyHeight > 14000) {
-            pdfConfig.format = 'A4';
-          } else {
-            pdfConfig.height = `${bodyHeight}px`;
-          }
-          const pdfBuffer = await page.pdf({
-            ...pdfConfig,
-            ...item.option,
-          });
-
-          return {
-            name: `${index + 1}.${item.name}.pdf`,
-            buffer: pdfBuffer,
-            headers: {
-              'Content-Type': 'application/pdf',
-            },
-          };
+        res.push({
+          name: `${index + 1}.${item.name}.pdf`,
+          buffer: pdfBuffer,
+          headers: {
+            'Content-Type': 'application/pdf',
+          },
         });
       }
-      const res: UrlPdfItem[] = await this.sliceTasks(queue);
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
@@ -249,14 +245,11 @@ export class SnapshotService {
       }
     } catch (e) {
       console.log(e);
-      throw new HttpException(
-        '系统错误：未能生成PDF',
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+      throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
       if (this.browser && this.browser.isConnected()) {
         await this.browser.close();
-        this.logger.debug(`toPDF - close browser`);
+        this.logger.debug(`url/pdf - close browser`);
       }
     }
   }
