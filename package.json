@@ -31,6 +31,7 @@
     "find-process": "^1.4.7",
     "hbs": "^4.2.0",
     "ioredis": "^5.2.1",
+    "jszip": "^3.10.1",
     "moment": "^2.29.4",
     "puppeteer": "^19.11.1",
     "puppeteer-extra": "^3.3.4",

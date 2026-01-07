@@ -11,9 +11,9 @@ async function bootstrap() {
     origin: '*',
     credentials: true,
   });
-  app.setGlobalPrefix(process.env.BASE_URL)
+  app.setGlobalPrefix(process.env.BASE_URL);
 
-  app.useGlobalFilters(new AllExceptionFilter())
+  app.useGlobalFilters(new AllExceptionFilter());
 
   app.useStaticAssets(join(__dirname, '..', 'public'));
   app.setBaseViewsDir(join(__dirname, '..', 'views'));
