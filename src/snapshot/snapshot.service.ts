@@ -7,7 +7,9 @@ import {
 } from '@nestjs/common';
 import puppeteer from 'puppeteer-extra';
 import { Browser, Page, KnownDevices, PDFOptions } from 'puppeteer';
+import JSZip from 'jszip';
 import { SnapshotOptionDto } from './../core/interfaces/requestDto';
+import { UrlPdfItem } from './snapshot.interface';
 /**
  * 常用分辨率
  * https://gs.statcounter.com/screen-resolution-stats/desktop/worldwide
@@ -103,11 +105,11 @@ export class SnapshotService {
   }
 
   async URL2PDF(url: string, pdfOption?: PDFOptions): Promise<Buffer> {
-    console.log(url, pdfOption)
     try {
       await this.init();
 
       this.page = (await this.browser.pages())[0];
+
       await this.page.goto(url, {
         timeout: 100000,
         /**
@@ -149,6 +151,136 @@ export class SnapshotService {
     }
   }
 
+  async sliceTasks(tasks: (() => Promise<void>)[], maxConcurrent = 10) {
+    const results: any[] = [];
+    const taskQueue = [...tasks];
+
+    // 2. 分批执行
+    while (taskQueue.length > 0) {
+      const currentTasks = taskQueue.splice(0, maxConcurrent);
+      const batchResults = await Promise.all(
+        currentTasks.map((task) =>
+          task().catch((e) => {
+            this.logger.error('PDF生成任务失败:', e);
+            throw e;
+          }),
+        ),
+      );
+      results.push(...batchResults);
+
+      // 3. 可选：添加批次间的延迟，避免资源竞争
+      if (taskQueue.length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    return results;
+  }
+  async urlToPdf(
+    config: {
+      url: string;
+      name: string;
+      option: PDFOptions;
+    }[],
+    zipName?: string,
+  ): Promise<UrlPdfItem> {
+    try {
+      await this.init();
+      const queue = [];
+
+      for (const [index, item] of config.entries()) {
+        queue.push(async () => {
+          const page = await this.browser.newPage();
+
+          await page.goto(item.url, {
+            timeout: 60 * 1000,
+            waitUntil: ['networkidle0'],
+          });
+
+          await this.waitPageLoaded(page, {
+            scrollTimes: 15,
+            scrollDelay: 500,
+            scrollOffset: 1000,
+          });
+
+          const bodyHeight = await page.evaluate(() => {
+            return document.documentElement.scrollHeight;
+          });
+
+          const pdfConfig = {
+            printBackground: true,
+            ...item.option,
+          };
+          if (bodyHeight > 14000) {
+            pdfConfig.format = 'A4';
+          } else {
+            pdfConfig.height = `${bodyHeight}px`;
+          }
+          const pdfBuffer = await page.pdf({
+            ...pdfConfig,
+            ...item.option,
+          });
+          await page.close();
+
+          return {
+            name: `${index + 1}.${item.name}.pdf`,
+            buffer: pdfBuffer,
+            headers: {
+              'Content-Type': 'application/pdf',
+            },
+          };
+        });
+      }
+      const res: UrlPdfItem[] = await this.sliceTasks(queue);
+      if (!res.length) {
+        throw new HttpException(
+          '系统错误：未能生成PDF',
+          HttpStatus.INTERNAL_SERVER_ERROR,
+        );
+      } else if (res.length === 1) {
+        return res[0];
+      } else {
+        const zipBuffer = await this.createZipBuffer(res);
+        return {
+          name: (zipName || Date.now()) + '.zip',
+          buffer: zipBuffer,
+          headers: {
+            'Content-Type': 'application/zip',
+          },
+        };
+      }
+    } catch (e) {
+      console.log(e);
+      throw new HttpException(
+        '系统错误：未能生成PDF',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    } finally {
+      if (this.browser && this.browser.isConnected()) {
+        await this.browser.close();
+        this.logger.debug(`toPDF - close browser`);
+      }
+    }
+  }
+  private async createZipBuffer(
+    results: { name: string; buffer: Buffer }[],
+  ): Promise<Buffer> {
+    const zip = new JSZip();
+
+    // 添加所有PDF文件到ZIP
+    results.forEach((t) => {
+      zip.file(t.name, new Uint8Array(t.buffer));
+    });
+
+    // 生成ZIP buffer
+    return await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: {
+        level: 6,
+      },
+    });
+  }
+
   private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
     /**
      * 等待中的请求
@@ -187,14 +319,16 @@ export class SnapshotService {
     const minScrollTimes = options?.minScrollTimes || 5;
     const scrollDelay = options?.scrollDelay || 1000;
     const scrollOffset = parseInt(options?.scrollOffset?.toString()) || 1000;
-      // 获取初始页面高度
-    let previousHeight = await page.evaluate(() => Math.max(
+    // 获取初始页面高度
+    let previousHeight = await page.evaluate(() =>
+      Math.max(
         document.body.scrollHeight,
         document.body.offsetHeight,
         document.documentElement.clientHeight,
         document.documentElement.scrollHeight,
-        document.documentElement.offsetHeight
-    ));
+        document.documentElement.offsetHeight,
+      ),
+    );
     let scrollCount = 0;
     let heightChanged = true;
     while (scrollCount < maxScrollTimes && heightChanged) {
@@ -203,21 +337,23 @@ export class SnapshotService {
 
       await page.waitForTimeout(scrollDelay);
       // 获取新的页面高度
-      const currentHeight = await page.evaluate(() => Math.max(
+      const currentHeight = await page.evaluate(() =>
+        Math.max(
           document.body.scrollHeight,
           document.body.offsetHeight,
           document.documentElement.clientHeight,
           document.documentElement.scrollHeight,
-          document.documentElement.offsetHeight
-      ));
+          document.documentElement.offsetHeight,
+        ),
+      );
 
       // 检查高度是否变化
       if (currentHeight === previousHeight && scrollCount > minScrollTimes) {
-          heightChanged = false;
+        heightChanged = false;
       } else {
-          previousHeight = currentHeight;
-          scrollCount++;
+        previousHeight = currentHeight;
+        scrollCount++;
       }
-  }
+    }
   }
 }

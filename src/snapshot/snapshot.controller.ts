@@ -39,4 +39,34 @@ export class SnapshotController {
       return true;
     }
   }
+
+  @Post('/url/pdf')
+  async urlToPaf(
+    @Body('config')
+    config: {
+      url: string;
+      name: string;
+      option: PDFOptions;
+    }[],
+    @Body('zipName') zipName = 'download',
+    @Res() res: Response,
+  ) {
+    try {
+      const { name, buffer, headers } = await this.snapshotService.urlToPdf(
+        config,
+        zipName,
+      );
+      for (const key in headers) {
+        res.set(key, headers[key]);
+      }
+      res.set('Access-Control-Expose-Headers', 'Content-Disposition');
+      res.set(
+        'Content-Disposition',
+        `attachment;filename=${encodeURIComponent(name)}`,
+      );
+      res.send(buffer);
+    } catch (e) {
+      res.status(200).send(e);
+    }
+  }
 }
