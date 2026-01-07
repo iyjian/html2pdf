@@ -65,6 +65,7 @@ export class SnapshotService {
         ],
         defaultViewport: null,
         // executablePath: path.join(__dirname, './../../chrome-linux/chrome'),
+        // executablePath: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
       });
       this.logger.debug(`init - new browser`);
     }
@@ -185,48 +186,54 @@ export class SnapshotService {
   ): Promise<UrlPdfItem> {
     try {
       await this.init();
-      const page = await this.browser.newPage();
-      const res: UrlPdfItem[] = [];
+      const queue = [];
 
       for (const [index, item] of config.entries()) {
-        console.log('正在进行', index, item);
-        await page.goto(item.url, {
-          timeout: 100 * 1000,
-          waitUntil: ['domcontentloaded'],
-        });
+        queue.push(async () => {
+          console.log('开始处理', index, item);
+          const page = await this.browser.newPage();
+          await this.initPage(page);
+          await page.goto(item.url, {
+            timeout: 60 * 1000,
+            waitUntil: ['networkidle0'],
+          });
 
-        await this.waitPageLoaded(page, {
-          scrollTimes: 15,
-          scrollDelay: 500,
-          scrollOffset: 1000,
-        });
+          await this.waitPageLoaded(page, {
+            scrollTimes: 15,
+            scrollDelay: 1000,
+            scrollOffset: 1000,
+          });
+          const bodyHeight = await page.evaluate(() => {
+            return document.documentElement.scrollHeight;
+          });
 
-        const bodyHeight = await page.evaluate(() => {
-          return document.documentElement.scrollHeight;
-        });
+          const pdfConfig = {
+            printBackground: true,
+            ...item.option,
+          };
+          if (bodyHeight > 14000) {
+            pdfConfig.format = 'A4';
+          } else {
+            pdfConfig.height = `${bodyHeight}px`;
+          }
+          const pdfBuffer = await page.pdf({
+            ...pdfConfig,
+            ...item.option,
+          });
 
-        const pdfConfig = {
-          printBackground: true,
-          ...item.option,
-        };
-        if (bodyHeight > 14000) {
-          pdfConfig.format = 'A4';
-        } else {
-          pdfConfig.height = `${bodyHeight}px`;
-        }
-        const pdfBuffer = await page.pdf({
-          ...pdfConfig,
-          ...item.option,
-        });
+          console.log('处理完成', index, item);
+          await page.close();
 
-        res.push({
-          name: `${index + 1}.${item.name}.pdf`,
-          buffer: pdfBuffer,
-          headers: {
-            'Content-Type': 'application/pdf',
-          },
+          return {
+            name: `${index + 1}.${item.name}.pdf`,
+            buffer: pdfBuffer,
+            headers: {
+              'Content-Type': 'application/pdf',
+            },
+          };
         });
       }
+      const res: UrlPdfItem[] = await this.sliceTasks(queue);
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
@@ -271,6 +278,81 @@ export class SnapshotService {
       compressionOptions: {
         level: 6,
       },
+    });
+  }
+
+  private async initPage(page) {
+    await page.evaluateOnNewDocument(() => {
+      // 禁用所有可能阻止关闭的API
+      const disableUnload = () => {
+        // 覆盖事件监听
+        const originalAdd = EventTarget.prototype.addEventListener;
+        EventTarget.prototype.addEventListener = function (
+          type,
+          listener,
+          options,
+        ) {
+          if (
+            type === 'beforeunload' ||
+            type === 'unload' ||
+            type === 'pagehide' ||
+            type === 'visibilitychange'
+          ) {
+            console.warn('阻止添加页面关闭事件:', type);
+            return;
+          }
+          return originalAdd.call(this, type, listener, options);
+        };
+
+        // 覆盖on事件属性
+        ['beforeunload', 'unload', 'pagehide'].forEach((eventType) => {
+          Object.defineProperty(window, `on${eventType}`, {
+            get: () => undefined,
+            set: () => {},
+            configurable: true,
+          });
+
+          Object.defineProperty(document, `on${eventType}`, {
+            get: () => undefined,
+            set: () => {},
+            configurable: true,
+          });
+        });
+
+        // 劫持confirm/alert/prompt
+        window.alert = () => {};
+        window.confirm = () => true;
+        window.prompt = () => null;
+
+        // 阻止默认的beforeunload行为
+        window.addEventListener(
+          'beforeunload',
+          (e) => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            e.returnValue = '';
+            return null;
+          },
+          { capture: true },
+        );
+      };
+
+      // 立即执行
+      disableUnload();
+
+      // 监听DOMContentLoaded，确保覆盖所有后续添加的事件
+      document.addEventListener('DOMContentLoaded', disableUnload, {
+        once: true,
+      });
+
+      // 监听load事件，做最后的清理
+      window.addEventListener(
+        'load',
+        () => {
+          setTimeout(disableUnload, 100);
+        },
+        { once: true },
+      );
     });
   }
 
