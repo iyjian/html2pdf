@@ -189,9 +189,10 @@ export class SnapshotService {
       const res: UrlPdfItem[] = [];
 
       for (const [index, item] of config.entries()) {
+        console.log('正在进行', index, item);
         await page.goto(item.url, {
-          timeout: 60 * 1000,
-          waitUntil: ['networkidle0'],
+          timeout: 100 * 1000,
+          waitUntil: ['domcontentloaded'],
         });
 
         await this.waitPageLoaded(page, {
@@ -291,6 +292,7 @@ export class SnapshotService {
     page.on('request', (request) => {
       //  this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - request url: ${request.url()}`)
       if (!(request.url() in waitingRequests)) {
+        console.log('1.waitingRequests', request.url());
         waitingRequests[request.url()] = false;
       }
       request.continue();
@@ -301,6 +303,8 @@ export class SnapshotService {
      */
     page.on('response', (response) => {
       const requestUrl = response.request().url();
+      console.log('2.response', requestUrl);
+
       waitingRequests[requestUrl] = true;
       // if (requestUrl === 'data:image/gif;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==') {
       //   this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - url ${requestUrl} has done.`)
