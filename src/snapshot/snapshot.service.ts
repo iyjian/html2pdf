@@ -219,7 +219,6 @@ export class SnapshotService {
             ...pdfConfig,
             ...item.option,
           });
-          await page.close();
 
           return {
             name: `${index + 1}.${item.name}.pdf`,
