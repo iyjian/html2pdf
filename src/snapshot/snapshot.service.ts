@@ -45,7 +45,7 @@ export class SnapshotService {
       // puppeteer.use(StealthPlugin());
 
       this.browser = await puppeteer.launch({
-        headless: 'new',
+        headless: true,
         devtools: debug,
         /**
          * 语言设置
@@ -86,7 +86,7 @@ export class SnapshotService {
         ...pdfOption,
       });
 
-      return pdfBuffer;
+      return Buffer.from(pdfBuffer);
     } catch (e) {
       throw new HttpException(
         '系统错误：未能生成PDF',
@@ -104,7 +104,9 @@ export class SnapshotService {
       }
     }
   }
-
+  sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
   async URL2PDF(url: string, pdfOption?: PDFOptions): Promise<Buffer> {
     try {
       await this.init();
@@ -132,7 +134,7 @@ export class SnapshotService {
         ...pdfOption,
       });
 
-      return pdfBuffer;
+      return Buffer.from(pdfBuffer);
     } catch (e) {
       console.log(e);
       throw new HttpException(
@@ -198,11 +200,6 @@ export class SnapshotService {
             waitUntil: ['networkidle0'],
           });
 
-          await this.waitPageLoaded(page, {
-            scrollTimes: 15,
-            scrollDelay: 1000,
-            scrollOffset: 1000,
-          });
           const bodyHeight = await page.evaluate(() => {
             return document.documentElement.scrollHeight;
           });
@@ -356,6 +353,20 @@ export class SnapshotService {
     });
   }
 
+  // private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
+  //   const scrollDelay = options?.scrollDelay || 1000;
+  //   const maxScrollTimes = options?.scrollTimes || 20;
+
+  //   // 滚动加载
+  //   for (let i = 0; i < maxScrollTimes; i++) {
+  //     await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+  //     await page.waitForTimeout(scrollDelay);
+  //   }
+
+  //   // 等待网络空闲
+  //   await page.waitForNetworkIdle({ idleTime: 500, timeout: 30000 });
+  // }
+
   private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
     /**
      * 等待中的请求
@@ -413,7 +424,8 @@ export class SnapshotService {
       // 执行滚动
       await page.mouse.wheel({ deltaY: scrollOffset });
 
-      await page.waitForTimeout(scrollDelay);
+      // await page.waitForTimeout(scrollDelay);
+      await this.sleep(scrollDelay);
       // 获取新的页面高度
       const currentHeight = await page.evaluate(() =>
         Math.max(
