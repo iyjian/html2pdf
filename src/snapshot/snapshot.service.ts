@@ -195,11 +195,10 @@ export class SnapshotService {
       await this.init();
       const res: UrlPdfItem[] = [];
 
-      const page = await this.browser.newPage();
-      await this.initPage(page);
-
       for (const [index, item] of config.entries()) {
         console.log('开始处理', index, item);
+        const page = await this.browser.newPage();
+        await this.initPage(page);
         await page.goto(item.url, {
           timeout: 60 * 1000,
           waitUntil: ['networkidle0'],
