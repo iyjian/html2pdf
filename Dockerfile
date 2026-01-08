@@ -1,4 +1,4 @@
-FROM node:18.15.0-bullseye
+FROM node:22.16.0-bullseye AS base
 
 ENV TZ=Asia/Shanghai 
 ENV DEBIAN_FRONTEND=noninteractive
