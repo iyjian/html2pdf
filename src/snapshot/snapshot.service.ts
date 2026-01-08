@@ -56,7 +56,7 @@ export class SnapshotService {
           // https://stackoverflow.com/questions/48297515/puppeteer-chromium-handle-crashing-memory-heavy-pages
           '--disable-dev-shm-usage',
           '--lang=zh',
-          '--single-process',
+          // '--single-process',
           '--no-zygote',
           // 字体加载问题 https://github.com/Zijue/blog/issues/44
           '--font-render-hinting=none',
