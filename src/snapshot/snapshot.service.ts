@@ -64,6 +64,7 @@ export class SnapshotService {
           '--font-render-hinting=none',
         ],
         defaultViewport: null,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
         // executablePath: path.join(__dirname, './../../chrome-linux/chrome'),
         // executablePath: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
       });

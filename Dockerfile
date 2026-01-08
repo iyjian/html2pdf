@@ -1,10 +1,8 @@
 FROM node:18.15.0-bullseye
 
-ENV TZ Asia/Shanghai \
-    DEBIAN_FRONTEND=noninteractive
-
+ENV TZ Asia/Shanghai 
+ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV development
-
 
 # RUN sed -i s@http://security.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
 # RUN sed -i s@http://deb.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
@@ -60,7 +58,9 @@ RUN apt-get install -y   ca-certificates \
                                       xdg-utils
 
 RUN apt-get install -y fontconfig xfonts-utils
-
+RUN apt-get install -y chromium chromium-driver
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 WORKDIR /app
 
 COPY fonts/* /usr/share/fonts/
@@ -75,4 +75,4 @@ RUN pnpm i
 
 COPY . ./
 
-RUN yarn run build
+RUN pnpm run build
