@@ -232,6 +232,7 @@ export class SnapshotService {
         });
       }
 
+      console.log('处理完成所有', res);
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
@@ -253,6 +254,7 @@ export class SnapshotService {
       console.log(e);
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
+      console.log('finally', this.browser?.connected);
       // if (this.browser?.connected) {
       //   await this.browser.close();
       //   this.logger.debug(`close browser`);
