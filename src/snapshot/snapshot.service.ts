@@ -6,7 +6,7 @@ import {
   Scope,
 } from '@nestjs/common';
 import puppeteer from 'puppeteer-extra';
-import { Browser, Page, KnownDevices, PDFOptions } from 'puppeteer';
+import { Browser, Page, PDFOptions } from 'puppeteer';
 import JSZip from 'jszip';
 import { SnapshotOptionDto } from './../core/interfaces/requestDto';
 import { UrlPdfItem } from './snapshot.interface';
@@ -35,8 +35,6 @@ export class SnapshotService {
   private isRunning = false;
 
   private readonly logger = new Logger(SnapshotService.name);
-
-  // constructor(private readonly alioss: AliossService) {}
 
   async init(debug = false) {
     if (!this.browser && this.isRunning === false) {
@@ -94,7 +92,7 @@ export class SnapshotService {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     } finally {
-      if (this.browser && this.browser.isConnected()) {
+      if (this.browser?.connected) {
         const pages = await this.browser.pages();
         for (const page of pages) {
           await page.close();
@@ -143,7 +141,7 @@ export class SnapshotService {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     } finally {
-      if (this.browser && this.browser.isConnected()) {
+      if (this.browser?.connected) {
         const pages = await this.browser.pages();
         for (const page of pages) {
           await page.close();
@@ -188,50 +186,53 @@ export class SnapshotService {
     zipName?: string,
   ): Promise<UrlPdfItem> {
     try {
+      if (config.length === 0) {
+        throw new HttpException(
+          '参数错误：请提供至少一个URL',
+          HttpStatus.BAD_REQUEST,
+        );
+      }
       await this.init();
-      const queue = [];
+      const res: UrlPdfItem[] = [];
+
+      const page = await this.browser.newPage();
+      await this.initPage(page);
 
       for (const [index, item] of config.entries()) {
-        queue.push(async () => {
-          console.log('开始处理', index, item);
-          const page = await this.browser.newPage();
-          await this.initPage(page);
-          await page.goto(item.url, {
-            timeout: 60 * 1000,
-            waitUntil: ['networkidle0'],
-          });
+        console.log('开始处理', index, item);
+        await page.goto(item.url, {
+          timeout: 60 * 1000,
+          waitUntil: ['networkidle0'],
+        });
 
-          const bodyHeight = await page.evaluate(() => {
-            return document.documentElement.scrollHeight;
-          });
+        const bodyHeight = await page.evaluate(() => {
+          return document.documentElement.scrollHeight;
+        });
 
-          const pdfConfig = {
-            printBackground: true,
-            ...item.option,
-          };
-          if (bodyHeight > 14000) {
-            pdfConfig.format = 'A4';
-          } else {
-            pdfConfig.height = `${bodyHeight}px`;
-          }
-          const pdfBuffer = await page.pdf({
-            ...pdfConfig,
-            ...item.option,
-          });
+        const pdfConfig = {
+          printBackground: true,
+          ...item.option,
+        };
+        if (bodyHeight > 14000) {
+          pdfConfig.format = 'A4';
+        } else {
+          pdfConfig.height = `${bodyHeight}px`;
+        }
+        const pdfBuffer = await page.pdf({
+          ...pdfConfig,
+          ...item.option,
+        });
 
-          console.log('处理完成', index, item);
-          await page.close();
-
-          return {
-            name: `${index + 1}.${item.name}.pdf`,
-            buffer: pdfBuffer,
-            headers: {
-              'Content-Type': 'application/pdf',
-            },
-          };
+        console.log('处理完成', index, item);
+        res.push({
+          name: `${index + 1}.${item.name}.pdf`,
+          buffer: Buffer.from(pdfBuffer),
+          headers: {
+            'Content-Type': 'application/pdf',
+          },
         });
       }
-      const res: UrlPdfItem[] = await this.sliceTasks(queue);
+
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
@@ -253,9 +254,9 @@ export class SnapshotService {
       console.log(e);
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
-      if (this.browser && this.browser.isConnected()) {
+      if (this.browser?.connected) {
         await this.browser.close();
-        this.logger.debug(`url/pdf - close browser`);
+        this.logger.debug(`close browser`);
       }
     }
   }
@@ -446,5 +447,8 @@ export class SnapshotService {
         scrollCount++;
       }
     }
+    await page.setRequestInterception(false);
+    page.removeAllListeners('request');
+    page.removeAllListeners('response');
   }
 }
