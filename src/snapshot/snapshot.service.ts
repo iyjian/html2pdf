@@ -197,7 +197,8 @@ export class SnapshotService {
 
       for (const [index, item] of config.entries()) {
         console.log('开始处理', index, item);
-        const page = await this.browser.newPage();
+        const page = (await this.browser.pages())[0];
+
         await this.initPage(page);
         await page.goto(item.url, {
           timeout: 60 * 1000,
@@ -208,7 +209,7 @@ export class SnapshotService {
           return document.documentElement.scrollHeight;
         });
 
-        const pdfConfig = {
+        const pdfConfig: PDFOptions = {
           printBackground: true,
           ...item.option,
         };
@@ -217,10 +218,7 @@ export class SnapshotService {
         } else {
           pdfConfig.height = `${bodyHeight}px`;
         }
-        const pdfBuffer = await page.pdf({
-          ...pdfConfig,
-          ...item.option,
-        });
+        const pdfBuffer = await page.pdf(pdfConfig);
 
         console.log('处理完成', index, item);
         res.push({
