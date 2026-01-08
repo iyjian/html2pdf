@@ -253,10 +253,10 @@ export class SnapshotService {
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
       console.log('finally', this.browser?.connected);
-      // if (this.browser?.connected) {
-      //   await this.browser.close();
-      //   this.logger.debug(`close browser`);
-      // }
+      if (this.browser?.connected) {
+        await this.browser.close();
+        this.logger.debug(`close browser`);
+      }
     }
   }
   private async createZipBuffer(
