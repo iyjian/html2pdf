@@ -1,8 +1,8 @@
 FROM node:18.15.0-bullseye
 
-ENV TZ Asia/Shanghai 
+ENV TZ=Asia/Shanghai 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV NODE_ENV development
+ENV NODE_ENV=development
 
 # RUN sed -i s@http://security.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
 # RUN sed -i s@http://deb.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
