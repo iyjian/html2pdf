@@ -197,7 +197,8 @@ export class SnapshotService {
 
       for (const [index, item] of config.entries()) {
         console.log('开始处理', index, item);
-        const page = (await this.browser.pages())[0];
+        const page = await this.browser.newPage();
+        // const page = (await this.browser.pages())[0];
 
         await this.initPage(page);
         await page.goto(item.url, {
@@ -220,7 +221,7 @@ export class SnapshotService {
         }
         const pdfBuffer = await page.pdf(pdfConfig);
 
-        console.log('处理完成', index, item);
+        // console.log('处理完成', index, item);
         res.push({
           name: `${index + 1}.${item.name}.pdf`,
           buffer: Buffer.from(pdfBuffer),
@@ -230,7 +231,7 @@ export class SnapshotService {
         });
       }
 
-      console.log('处理完成所有', res);
+      // console.log('处理完成所有', res);
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
