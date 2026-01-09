@@ -1,21 +1,18 @@
 FROM node:22.16.0-bullseye AS base
 
 ENV TZ=Asia/Shanghai 
+
 ENV DEBIAN_FRONTEND=noninteractive
+
 ENV NODE_ENV=development
 
-# RUN sed -i s@http://security.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
-# RUN sed -i s@http://deb.debian.org@http://mirrors.aliyun.com@g /etc/apt/sources.list
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
-# RUN npm install -g pnpm@9.14.4
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 RUN npm install -g pnpm
 
 RUN apt-get update -y
-
-# RUN ln -fs /usr/share/zoneinfo/${TZ} /etc/localtime \
-#     && echo ${TZ} > /etc/timezone \
-#     && dpkg-reconfigure --frontend noninteractive tzdata \
-#     && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get install -y   ca-certificates \
                                       fonts-liberation \
@@ -59,8 +56,7 @@ RUN apt-get install -y   ca-certificates \
 
 RUN apt-get install -y fontconfig xfonts-utils
 RUN apt-get install -y chromium chromium-driver
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 WORKDIR /app
 
 COPY fonts/* /usr/share/fonts/

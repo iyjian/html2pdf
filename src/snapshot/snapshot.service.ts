@@ -214,6 +214,8 @@ export class SnapshotService {
           printBackground: true,
           ...item.option,
         };
+
+        console.log('bodyHeight', bodyHeight);
         if (bodyHeight > 14000) {
           pdfConfig.format = 'A4';
         } else {
@@ -229,6 +231,14 @@ export class SnapshotService {
             'Content-Type': 'application/pdf',
           },
         });
+
+        await page.close();
+        console.log(
+          '处理完成 page已关闭',
+          index,
+          page.isClosed(),
+          (await this.browser.pages()).length,
+        );
       }
 
       // console.log('处理完成所有', res);
@@ -254,8 +264,10 @@ export class SnapshotService {
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
       console.log('finally', this.browser?.connected);
+
       if (this.browser?.connected) {
         await this.browser.close();
+        console.log('执行完毕并关闭browser');
         this.logger.debug(`close browser`);
       }
     }
