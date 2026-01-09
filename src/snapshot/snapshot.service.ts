@@ -247,6 +247,15 @@ export class SnapshotService {
           '系统错误：未能生成PDF',
           HttpStatus.INTERNAL_SERVER_ERROR,
         );
+      } else if (zipName) {
+        const zipBuffer = await this.createZipBuffer(res);
+        return {
+          name: (zipName || Date.now()) + '.zip',
+          buffer: zipBuffer,
+          headers: {
+            'Content-Type': 'application/zip',
+          },
+        };
       } else if (res.length === 1) {
         return res[0];
       } else {
