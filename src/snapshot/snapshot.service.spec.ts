@@ -9,7 +9,7 @@ describe('SnapshotService', () => {
       providers: [SnapshotService],
     }).compile();
 
-    service = module.get<SnapshotService>(SnapshotService);
+    service = await module.resolve<SnapshotService>(SnapshotService);
   });
 
   it('should be defined', () => {

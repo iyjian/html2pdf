@@ -22,6 +22,12 @@ import { UrlPdfItem } from './snapshot.interface';
 
 @Injectable({ scope: Scope.REQUEST })
 export class SnapshotService {
+  private readonly defaultPdfViewport = {
+    width: 1440,
+    height: 1024,
+    deviceScaleFactor: 1,
+  } as const;
+
   /**
    * 浏览器实例
    */
@@ -201,25 +207,46 @@ export class SnapshotService {
         // const page = (await this.browser.pages())[0];
 
         await this.initPage(page);
+        await this.initPdfViewport(page);
         await page.goto(item.url, {
           timeout: 60 * 1000,
           waitUntil: ['networkidle0'],
         });
 
-        const bodyHeight = await page.evaluate(() => {
-          return document.documentElement.scrollHeight;
+        await this.waitPageLoaded(page, {
+          scrollTimes: 20,
+          scrollDelay: 1000,
+          scrollOffset: 1000,
         });
+
+        let { width: bodyWidth, height: bodyHeight } =
+          await this.getPageDimensions(page);
+
+        if (bodyWidth > this.getViewportWidth(page)) {
+          await this.expandPdfViewport(page, bodyWidth);
+          await this.waitPageLoaded(page, {
+            scrollTimes: 20,
+            scrollDelay: 1000,
+            scrollOffset: 1000,
+          });
+          ({ width: bodyWidth, height: bodyHeight } =
+            await this.getPageDimensions(page));
+        }
 
         const pdfConfig: PDFOptions = {
           printBackground: true,
+          preferCSSPageSize: false,
           ...item.option,
         };
 
-        console.log('bodyHeight', bodyHeight);
-        if (bodyHeight > 14000) {
-          pdfConfig.format = 'A4';
-        } else {
-          pdfConfig.height = `${bodyHeight}px`;
+        console.log('pageDimensions', { bodyWidth, bodyHeight });
+        if (!pdfConfig.format) {
+          if (pdfConfig.width === undefined) {
+            pdfConfig.width = `${bodyWidth}px`;
+          }
+          if (pdfConfig.height === undefined) {
+            pdfConfig.height = `${bodyHeight}px`;
+          }
         }
         const pdfBuffer = await page.pdf(pdfConfig);
 
@@ -376,6 +403,52 @@ export class SnapshotService {
     });
   }
 
+  private async initPdfViewport(page: Page): Promise<void> {
+    await page.setViewport({ ...this.defaultPdfViewport });
+  }
+
+  private getViewportWidth(page: Page): number {
+    return page.viewport()?.width || this.defaultPdfViewport.width;
+  }
+
+  private async expandPdfViewport(page: Page, width: number): Promise<void> {
+    const viewport = page.viewport() || this.defaultPdfViewport;
+
+    await page.setViewport({
+      ...viewport,
+      width: Math.ceil(width),
+    });
+    await this.sleep(200);
+  }
+
+  private async getPageDimensions(
+    page: Page,
+  ): Promise<{ width: number; height: number }> {
+    return await page.evaluate(() => {
+      const body = document.body;
+      const documentElement = document.documentElement;
+
+      return {
+        width: Math.max(
+          body?.clientWidth || 0,
+          body?.offsetWidth || 0,
+          body?.scrollWidth || 0,
+          documentElement?.clientWidth || 0,
+          documentElement?.offsetWidth || 0,
+          documentElement?.scrollWidth || 0,
+        ),
+        height: Math.max(
+          body?.clientHeight || 0,
+          body?.offsetHeight || 0,
+          body?.scrollHeight || 0,
+          documentElement?.clientHeight || 0,
+          documentElement?.offsetHeight || 0,
+          documentElement?.scrollHeight || 0,
+        ),
+      };
+    });
+  }
+
   // private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
   //   const scrollDelay = options?.scrollDelay || 1000;
   //   const maxScrollTimes = options?.scrollTimes || 20;
@@ -432,33 +505,19 @@ export class SnapshotService {
     const scrollDelay = options?.scrollDelay || 1000;
     const scrollOffset = parseInt(options?.scrollOffset?.toString()) || 1000;
     // 获取初始页面高度
-    let previousHeight = await page.evaluate(() =>
-      Math.max(
-        document.body.scrollHeight,
-        document.body.offsetHeight,
-        document.documentElement.clientHeight,
-        document.documentElement.scrollHeight,
-        document.documentElement.offsetHeight,
-      ),
-    );
+    let { height: previousHeight } = await this.getPageDimensions(page);
     let scrollCount = 0;
     let heightChanged = true;
     while (scrollCount < maxScrollTimes && heightChanged) {
       // 执行滚动
-      await page.mouse.wheel({ deltaY: scrollOffset });
+      await page.evaluate((offset) => {
+        window.scrollBy(0, offset);
+      }, scrollOffset);
 
       // await page.waitForTimeout(scrollDelay);
       await this.sleep(scrollDelay);
       // 获取新的页面高度
-      const currentHeight = await page.evaluate(() =>
-        Math.max(
-          document.body.scrollHeight,
-          document.body.offsetHeight,
-          document.documentElement.clientHeight,
-          document.documentElement.scrollHeight,
-          document.documentElement.offsetHeight,
-        ),
-      );
+      const { height: currentHeight } = await this.getPageDimensions(page);
 
       // 检查高度是否变化
       if (currentHeight === previousHeight && scrollCount > minScrollTimes) {
@@ -467,6 +526,17 @@ export class SnapshotService {
         previousHeight = currentHeight;
         scrollCount++;
       }
+    }
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+    });
+    try {
+      await page.waitForNetworkIdle({
+        idleTime: scrollDelay,
+        timeout: Math.max(scrollDelay * 10, 5000),
+      });
+    } catch (e) {
+      this.logger.warn('waitPageLoaded - network idle timeout');
     }
     await page.setRequestInterception(false);
     page.removeAllListeners('request');
