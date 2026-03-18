@@ -28,6 +28,20 @@ export class SnapshotService {
     deviceScaleFactor: 1,
   } as const;
 
+  // Limit parallel page renders so a single batch does not exhaust Chromium CPU/memory.
+  private readonly urlPdfMaxConcurrent = Math.max(
+    Number.parseInt(process.env.SNAPSHOT_URL_PDF_CONCURRENCY || '10', 10) || 10,
+    1,
+  );
+
+  // Batch export uses shorter waits and exits early once scrolling no longer reveals new content.
+  private readonly urlPdfLoadOptions: SnapshotOptionDto = {
+    scrollTimes: 20,
+    minScrollTimes: 4,
+    scrollDelay: 400,
+    scrollOffset: 2000,
+  };
+
   /**
    * 浏览器实例
    */
@@ -159,11 +173,11 @@ export class SnapshotService {
     }
   }
 
-  async sliceTasks(tasks: (() => Promise<void>)[], maxConcurrent = 10) {
-    const results: any[] = [];
+  async sliceTasks<T>(tasks: (() => Promise<T>)[], maxConcurrent = 10) {
+    const results: T[] = [];
     const taskQueue = [...tasks];
 
-    // 2. 分批执行
+    // Execute in bounded batches to avoid opening too many pages at once.
     while (taskQueue.length > 0) {
       const currentTasks = taskQueue.splice(0, maxConcurrent);
       const batchResults = await Promise.all(
@@ -199,74 +213,10 @@ export class SnapshotService {
         );
       }
       await this.init();
-      const res: UrlPdfItem[] = [];
-
-      for (const [index, item] of config.entries()) {
-        console.log('开始处理', index, item);
-        const page = await this.browser.newPage();
-        // const page = (await this.browser.pages())[0];
-
-        await this.initPage(page);
-        await this.initPdfViewport(page);
-        await page.goto(item.url, {
-          timeout: 60 * 1000,
-          waitUntil: ['networkidle0'],
-        });
-
-        await this.waitPageLoaded(page, {
-          scrollTimes: 20,
-          scrollDelay: 1000,
-          scrollOffset: 1000,
-        });
-
-        let { width: bodyWidth, height: bodyHeight } =
-          await this.getPageDimensions(page);
-
-        if (bodyWidth > this.getViewportWidth(page)) {
-          await this.expandPdfViewport(page, bodyWidth);
-          await this.waitPageLoaded(page, {
-            scrollTimes: 20,
-            scrollDelay: 1000,
-            scrollOffset: 1000,
-          });
-          ({ width: bodyWidth, height: bodyHeight } =
-            await this.getPageDimensions(page));
-        }
-
-        const pdfConfig: PDFOptions = {
-          printBackground: true,
-          preferCSSPageSize: false,
-          ...item.option,
-        };
-
-        console.log('pageDimensions', { bodyWidth, bodyHeight });
-        if (!pdfConfig.format) {
-          if (pdfConfig.width === undefined) {
-            pdfConfig.width = `${bodyWidth}px`;
-          }
-          if (pdfConfig.height === undefined) {
-            pdfConfig.height = `${bodyHeight}px`;
-          }
-        }
-        const pdfBuffer = await page.pdf(pdfConfig);
-
-        // console.log('处理完成', index, item);
-        res.push({
-          name: `${index + 1}.${item.name}.pdf`,
-          buffer: Buffer.from(pdfBuffer),
-          headers: {
-            'Content-Type': 'application/pdf',
-          },
-        });
-
-        await page.close();
-        console.log(
-          '处理完成 page已关闭',
-          index,
-          page.isClosed(),
-          (await this.browser.pages()).length,
-        );
-      }
+      const tasks = config.map((item, index) => {
+        return () => this.renderUrlPdfItem(item, index);
+      });
+      const res = await this.sliceTasks(tasks, this.urlPdfMaxConcurrent);
 
       // console.log('处理完成所有', res);
       if (!res.length) {
@@ -296,15 +246,74 @@ export class SnapshotService {
         };
       }
     } catch (e) {
-      console.log(e);
+      this.logger.error('urlToPdf - failed', e);
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
-      console.log('finally', this.browser?.connected);
-
       if (this.browser?.connected) {
         await this.browser.close();
-        console.log('执行完毕并关闭browser');
         this.logger.debug(`close browser`);
+      }
+    }
+  }
+
+  private async renderUrlPdfItem(
+    item: {
+      url: string;
+      name: string;
+      option: PDFOptions;
+    },
+    index: number,
+  ): Promise<UrlPdfItem> {
+    const page = await this.browser.newPage();
+
+    try {
+      await this.initPage(page);
+      await this.initPdfViewport(page);
+      // Only wait for the initial document load here; deeper stabilization is handled below.
+      await page.goto(item.url, {
+        timeout: 60 * 1000,
+        waitUntil: ['load'],
+      });
+
+      await this.waitPageLoaded(page, this.urlPdfLoadOptions);
+
+      let { width: bodyWidth, height: bodyHeight } =
+        await this.getPageDimensions(page);
+
+      if (bodyWidth > this.getViewportWidth(page)) {
+        await this.expandPdfViewport(page, bodyWidth);
+        await this.waitPageLoaded(page, this.urlPdfLoadOptions);
+        ({ width: bodyWidth, height: bodyHeight } =
+          await this.getPageDimensions(page));
+      }
+
+      const pdfConfig: PDFOptions = {
+        printBackground: true,
+        preferCSSPageSize: false,
+        ...item.option,
+      };
+
+      if (!pdfConfig.format) {
+        if (pdfConfig.width === undefined) {
+          pdfConfig.width = `${bodyWidth}px`;
+        }
+        if (pdfConfig.height === undefined) {
+          pdfConfig.height = `${bodyHeight}px`;
+        }
+      }
+
+      const pdfBuffer = await page.pdf(pdfConfig);
+
+      return {
+        name: `${index + 1}.${item.name}.pdf`,
+        buffer: Buffer.from(pdfBuffer),
+        headers: {
+          'Content-Type': 'application/pdf',
+        },
+      };
+    } finally {
+      if (!page.isClosed()) {
+        await page.close();
       }
     }
   }
@@ -449,6 +458,34 @@ export class SnapshotService {
     });
   }
 
+  private async getPageScrollState(
+    page: Page,
+  ): Promise<{ height: number; scrollTop: number; viewportHeight: number }> {
+    return await page.evaluate(() => {
+      const body = document.body;
+      const documentElement = document.documentElement;
+
+      return {
+        height: Math.max(
+          body?.clientHeight || 0,
+          body?.offsetHeight || 0,
+          body?.scrollHeight || 0,
+          documentElement?.clientHeight || 0,
+          documentElement?.offsetHeight || 0,
+          documentElement?.scrollHeight || 0,
+        ),
+        scrollTop:
+          window.scrollY ||
+          window.pageYOffset ||
+          documentElement?.scrollTop ||
+          body?.scrollTop ||
+          0,
+        viewportHeight:
+          window.innerHeight || documentElement?.clientHeight || 0,
+      };
+    });
+  }
+
   // private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
   //   const scrollDelay = options?.scrollDelay || 1000;
   //   const maxScrollTimes = options?.scrollTimes || 20;
@@ -464,82 +501,54 @@ export class SnapshotService {
   // }
 
   private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
-    /**
-     * 等待中的请求
-     */
-    const waitingRequests = {
-      /**
-       * url: isCompleted
-       */
-    };
-
-    await page.setRequestInterception(true);
-
-    /**
-     * 注册请求的监听
-     */
-    page.on('request', (request) => {
-      //  this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - request url: ${request.url()}`)
-      if (!(request.url() in waitingRequests)) {
-        console.log('1.waitingRequests', request.url());
-        waitingRequests[request.url()] = false;
-      }
-      request.continue();
-    });
-
-    /**
-     * 注册response的监听
-     */
-    page.on('response', (response) => {
-      const requestUrl = response.request().url();
-      console.log('2.response', requestUrl);
-
-      waitingRequests[requestUrl] = true;
-      // if (requestUrl === 'data:image/gif;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQImWNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==') {
-      //   this.logger.verbose(`taskeSnapshot - screenshot: ${screenshotId} - url ${requestUrl} has done.`)
-      // }
-    });
-
     const maxScrollTimes = options?.scrollTimes || 20;
-    const minScrollTimes = options?.minScrollTimes || 5;
+    const minStableScrollRounds = Math.max(options?.minScrollTimes || 5, 1);
     const scrollDelay = options?.scrollDelay || 1000;
     const scrollOffset = parseInt(options?.scrollOffset?.toString()) || 1000;
-    // 获取初始页面高度
-    let { height: previousHeight } = await this.getPageDimensions(page);
     let scrollCount = 0;
-    let heightChanged = true;
-    while (scrollCount < maxScrollTimes && heightChanged) {
+    let stableScrollRounds = 0;
+    let previousState = await this.getPageScrollState(page);
+
+    while (scrollCount < maxScrollTimes) {
       // 执行滚动
       await page.evaluate((offset) => {
         window.scrollBy(0, offset);
       }, scrollOffset);
 
-      // await page.waitForTimeout(scrollDelay);
       await this.sleep(scrollDelay);
-      // 获取新的页面高度
-      const { height: currentHeight } = await this.getPageDimensions(page);
 
-      // 检查高度是否变化
-      if (currentHeight === previousHeight && scrollCount > minScrollTimes) {
-        heightChanged = false;
+      const currentState = await this.getPageScrollState(page);
+      const heightStable = currentState.height === previousState.height;
+      const reachedBottom =
+        currentState.scrollTop + currentState.viewportHeight >=
+        currentState.height - 2;
+      const scrollStuck = currentState.scrollTop === previousState.scrollTop;
+
+      // Stop once scrolling no longer increases height and the viewport is already at the end.
+      if (heightStable && (reachedBottom || scrollStuck)) {
+        stableScrollRounds += 1;
       } else {
-        previousHeight = currentHeight;
-        scrollCount++;
+        stableScrollRounds = 0;
+      }
+
+      previousState = currentState;
+      scrollCount += 1;
+
+      if (stableScrollRounds >= minStableScrollRounds) {
+        break;
       }
     }
+
     await page.evaluate(() => {
       window.scrollTo(0, 0);
     });
     try {
       await page.waitForNetworkIdle({
         idleTime: scrollDelay,
-        timeout: Math.max(scrollDelay * 10, 5000),
+        timeout: Math.max(scrollDelay * 4, 1500),
       });
     } catch (e) {
       this.logger.warn('waitPageLoaded - network idle timeout');
     }
-    await page.setRequestInterception(false);
-    page.removeAllListeners('request');
-    page.removeAllListeners('response');
   }
 }
