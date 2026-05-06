@@ -10,6 +10,19 @@ import { Browser, Page, PDFOptions } from 'puppeteer';
 import JSZip from 'jszip';
 import { SnapshotOptionDto } from './../core/interfaces/requestDto';
 import { UrlPdfItem } from './snapshot.interface';
+
+interface UrlPdfMediaFailure {
+  type: 'image' | 'video';
+  url: string;
+  reason: string;
+}
+
+interface UrlPdfMediaLoadStatus {
+  total: number;
+  loaded: number;
+  failed: UrlPdfMediaFailure[];
+}
+
 /**
  * 常用分辨率
  * https://gs.statcounter.com/screen-resolution-stats/desktop/worldwide
@@ -34,13 +47,18 @@ export class SnapshotService {
     1,
   );
 
-  // Batch export uses shorter waits and exits early once scrolling no longer reveals new content.
+  // urlToPdf 批量导出默认等待预算：
+  // 1. 滚动触发懒加载：最多 20 轮 * 800ms，连续 4 轮稳定后提前结束。
+  // 2. 网络空闲：等待 800ms idle，最多等 3200ms。
+  // 3. 图片/视频：首次检查 + 3 次重试，每轮媒体等待最多 3200ms。
   private readonly urlPdfLoadOptions: SnapshotOptionDto = {
     scrollTimes: 20,
     minScrollTimes: 4,
-    scrollDelay: 400,
+    scrollDelay: 800,
     scrollOffset: 2000,
   };
+
+  private readonly urlPdfMediaRetryTimes = 3;
 
   /**
    * 浏览器实例
@@ -206,19 +224,26 @@ export class SnapshotService {
     zipName?: string,
   ): Promise<UrlPdfItem> {
     try {
+      // 1. 参数校验：没有 URL 时不启动浏览器，直接返回请求错误。
       if (config.length === 0) {
         throw new HttpException(
           '参数错误：请提供至少一个URL',
           HttpStatus.BAD_REQUEST,
         );
       }
+
+      // 2. 初始化本次请求专用的 Chromium；本次请求内 newPage 共享同一个 browser context。
       await this.init();
+
+      // 3. 把每个 URL 包成延迟执行任务，交给 sliceTasks 控制并发。
       const tasks = config.map((item, index) => {
         return () => this.renderUrlPdfItem(item, index);
       });
+
+      // 4. 默认最多 10 个页面并发；可用 SNAPSHOT_URL_PDF_CONCURRENCY 调小。
       const res = await this.sliceTasks(tasks, this.urlPdfMaxConcurrent);
 
-      // console.log('处理完成所有', res);
+      // 5. 输出规则：单个 PDF 直接返回；多个 PDF 或传入 zipName 时打包为 ZIP。
       if (!res.length) {
         throw new HttpException(
           '系统错误：未能生成PDF',
@@ -249,6 +274,7 @@ export class SnapshotService {
       this.logger.error('urlToPdf - failed', e);
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
+      // 6. 请求结束后关闭浏览器，避免 localStorage/token 在不同请求之间残留。
       if (this.browser?.connected) {
         await this.browser.close();
         this.logger.debug(`close browser`);
@@ -264,29 +290,36 @@ export class SnapshotService {
     },
     index: number,
   ): Promise<UrlPdfItem> {
+    // 每个 URL 单独打开一个 page；并发时这些 page 会同时共享同一个 browser。
     const page = await this.browser.newPage();
 
     try {
+      // 页面脚本初始化：禁用 unload/dialog 干扰，并设置 PDF 基础 viewport。
       await this.initPage(page);
       await this.initPdfViewport(page);
-      // Only wait for the initial document load here; deeper stabilization is handled below.
+
+      // 首次导航只等 window load，最长 60s；懒加载、网络空闲和媒体加载在 waitPageLoaded 中处理。
       await page.goto(item.url, {
         timeout: 60 * 1000,
         waitUntil: ['load'],
       });
 
+      // 页面稳定等待：默认约 3.2-16s 滚动 + 最多 3.2s 网络空闲 + 最多约 12.8s 媒体等待。
       await this.waitPageLoaded(page, this.urlPdfLoadOptions);
 
+      // 懒加载完成后再测量页面尺寸，避免 PDF 高度少算。
       let { width: bodyWidth, height: bodyHeight } =
         await this.getPageDimensions(page);
 
       if (bodyWidth > this.getViewportWidth(page)) {
+        // 宽页面需要扩展 viewport；扩展后可能触发响应式布局和新的懒加载，所以再等一次。
         await this.expandPdfViewport(page, bodyWidth);
         await this.waitPageLoaded(page, this.urlPdfLoadOptions);
         ({ width: bodyWidth, height: bodyHeight } =
           await this.getPageDimensions(page));
       }
 
+      // 未指定 format 时，按完整页面像素尺寸输出；调用方传入的 PDFOptions 优先。
       const pdfConfig: PDFOptions = {
         printBackground: true,
         preferCSSPageSize: false,
@@ -302,6 +335,7 @@ export class SnapshotService {
         }
       }
 
+      // 图片/视频三次重试后仍失败只记录日志，不阻断 PDF 输出。
       const pdfBuffer = await page.pdf(pdfConfig);
 
       return {
@@ -312,6 +346,7 @@ export class SnapshotService {
         },
       };
     } finally {
+      // 无论成功或失败都关闭当前 page，避免批量导出时页面句柄泄漏。
       if (!page.isClosed()) {
         await page.close();
       }
@@ -509,8 +544,8 @@ export class SnapshotService {
     let stableScrollRounds = 0;
     let previousState = await this.getPageScrollState(page);
 
+    // 先向下滚动触发图片、视频、列表等懒加载内容；默认最多 20 轮，每轮等待 800ms。
     while (scrollCount < maxScrollTimes) {
-      // 执行滚动
       await page.evaluate((offset) => {
         window.scrollBy(0, offset);
       }, scrollOffset);
@@ -524,7 +559,7 @@ export class SnapshotService {
         currentState.height - 2;
       const scrollStuck = currentState.scrollTop === previousState.scrollTop;
 
-      // Stop once scrolling no longer increases height and the viewport is already at the end.
+      // 页面高度不再变化且已到底部/滚不动时记为稳定；默认连续 4 轮稳定后提前结束。
       if (heightStable && (reachedBottom || scrollStuck)) {
         stableScrollRounds += 1;
       } else {
@@ -543,6 +578,7 @@ export class SnapshotService {
       window.scrollTo(0, 0);
     });
     try {
+      // 滚动结束后等一次短网络空闲；默认等 800ms idle，最多等 3200ms，超时只告警。
       await page.waitForNetworkIdle({
         idleTime: scrollDelay,
         timeout: Math.max(scrollDelay * 4, 1500),
@@ -550,5 +586,304 @@ export class SnapshotService {
     } catch (e) {
       this.logger.warn('waitPageLoaded - network idle timeout');
     }
+    try {
+      // 最后显式等待 img/video；默认首次检查 + 3 次重试，每次最多 3200ms。
+      await this.waitMediaLoaded(
+        page,
+        this.urlPdfMediaRetryTimes,
+        Math.max(scrollDelay * 4, 3000),
+      );
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      this.logger.warn(
+        `waitPageLoaded - media wait failed, continue PDF: ${errorMessage}`,
+      );
+    }
+  }
+
+  private async waitMediaLoaded(
+    page: Page,
+    retryTimes = 3,
+    timeout = 3000,
+  ): Promise<void> {
+    // 首轮只检查当前媒体状态；都已加载时立即返回，不额外等待。
+    let status = await this.collectMediaLoadStatus(page, timeout);
+
+    for (let retryIndex = 1; retryIndex <= retryTimes; retryIndex += 1) {
+      if (status.failed.length === 0) {
+        return;
+      }
+
+      this.logger.warn(
+        `waitMediaLoaded - retry ${retryIndex}/${retryTimes}, failed ${status.failed.length}/${status.total}`,
+      );
+      // 对仍失败的 img/video 发起重试，然后再次等待其完成。
+      await this.retryFailedMedia(page);
+      status = await this.collectMediaLoadStatus(page, timeout);
+    }
+
+    if (status.failed.length > 0) {
+      // 三次重试后仍失败只记录资源类型、数量和样例 URL，不 throw，继续生成 PDF。
+      this.logger.error(
+        `waitMediaLoaded - media failed after ${retryTimes} retries: ${this.formatMediaFailureSummary(
+          status.failed,
+        )}`,
+      );
+    }
+  }
+
+  private async collectMediaLoadStatus(
+    page: Page,
+    timeout: number,
+  ): Promise<UrlPdfMediaLoadStatus> {
+    return await page.evaluate(async (timeoutMs) => {
+      // 单个媒体等待使用超时保护，避免一个坏资源卡住整个 PDF。
+      const waitWithTimeout = <T, U>(
+        promise: Promise<T>,
+        timeoutValue: U,
+      ): Promise<T | U> => {
+        return Promise.race([
+          promise,
+          new Promise<U>((resolve) => {
+            window.setTimeout(() => resolve(timeoutValue), timeoutMs);
+          }),
+        ]);
+      };
+
+      const getImageUrl = (image: HTMLImageElement): string => {
+        return (
+          image.currentSrc ||
+          image.src ||
+          image.getAttribute('src') ||
+          image.getAttribute('srcset') ||
+          ''
+        );
+      };
+
+      const getVideoUrl = (video: HTMLVideoElement): string => {
+        return (
+          video.currentSrc ||
+          video.src ||
+          video.getAttribute('src') ||
+          video.querySelector('source')?.src ||
+          video.querySelector('source')?.getAttribute('src') ||
+          ''
+        );
+      };
+
+      const isImageReady = (image: HTMLImageElement): boolean => {
+        return (
+          image.complete && image.naturalWidth > 0 && image.naturalHeight > 0
+        );
+      };
+
+      const waitImage = async (
+        image: HTMLImageElement,
+      ): Promise<UrlPdfMediaFailure | null> => {
+        const url = getImageUrl(image);
+        if (!url) {
+          return null;
+        }
+
+        image.loading = 'eager';
+
+        // 图片必须 complete 且有 naturalWidth/naturalHeight；能 decode 时再尝试解码。
+        if (isImageReady(image)) {
+          if (typeof image.decode === 'function') {
+            await waitWithTimeout(
+              image.decode().catch(() => undefined),
+              null,
+            );
+          }
+          return isImageReady(image)
+            ? null
+            : { type: 'image', url, reason: 'image-decode-not-ready' };
+        }
+
+        if (image.complete) {
+          return { type: 'image', url, reason: 'image-error' };
+        }
+
+        const loadResult = await waitWithTimeout(
+          new Promise<'load' | 'error'>((resolve) => {
+            const cleanup = () => {
+              image.removeEventListener('load', handleLoad);
+              image.removeEventListener('error', handleError);
+            };
+            const handleLoad = () => {
+              cleanup();
+              resolve('load');
+            };
+            const handleError = () => {
+              cleanup();
+              resolve('error');
+            };
+
+            image.addEventListener('load', handleLoad, { once: true });
+            image.addEventListener('error', handleError, { once: true });
+          }),
+          'timeout',
+        );
+
+        if (loadResult === 'load' && typeof image.decode === 'function') {
+          await waitWithTimeout(
+            image.decode().catch(() => undefined),
+            null,
+          );
+        }
+
+        return isImageReady(image)
+          ? null
+          : {
+              type: 'image',
+              url,
+              reason:
+                loadResult === 'timeout' ? 'image-timeout' : 'image-error',
+            };
+      };
+
+      const isVideoReady = (video: HTMLVideoElement): boolean => {
+        return video.readyState >= 2;
+      };
+
+      const waitVideo = async (
+        video: HTMLVideoElement,
+      ): Promise<UrlPdfMediaFailure | null> => {
+        const url = getVideoUrl(video);
+        if (!url) {
+          return null;
+        }
+
+        video.preload = 'auto';
+
+        // video.readyState >= 2 表示当前帧可用，PDF 打印时能拿到画面。
+        if (isVideoReady(video)) {
+          return null;
+        }
+
+        const loadResult = await waitWithTimeout(
+          new Promise<'load' | 'error'>((resolve) => {
+            const cleanup = () => {
+              video.removeEventListener('loadeddata', handleLoad);
+              video.removeEventListener('canplay', handleLoad);
+              video.removeEventListener('error', handleError);
+              video.removeEventListener('abort', handleError);
+            };
+            const handleLoad = () => {
+              cleanup();
+              resolve('load');
+            };
+            const handleError = () => {
+              cleanup();
+              resolve('error');
+            };
+
+            video.addEventListener('loadeddata', handleLoad, { once: true });
+            video.addEventListener('canplay', handleLoad, { once: true });
+            video.addEventListener('error', handleError, { once: true });
+            video.addEventListener('abort', handleError, { once: true });
+          }),
+          'timeout',
+        );
+
+        return isVideoReady(video)
+          ? null
+          : {
+              type: 'video',
+              url,
+              reason:
+                loadResult === 'timeout' ? 'video-timeout' : 'video-error',
+            };
+      };
+
+      const images = Array.from(document.images);
+      const videos = Array.from(document.querySelectorAll('video'));
+      // 同一页面内的图片/视频并行等待，整体等待时长由 timeout 控制。
+      const results = await Promise.all([
+        ...images.map((image) => waitImage(image)),
+        ...videos.map((video) => waitVideo(video)),
+      ]);
+      const failed = results.filter(Boolean) as UrlPdfMediaFailure[];
+
+      return {
+        total: images.length + videos.length,
+        loaded: images.length + videos.length - failed.length,
+        failed,
+      };
+    }, timeout);
+  }
+
+  private async retryFailedMedia(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      const isImageReady = (image: HTMLImageElement): boolean => {
+        return (
+          image.complete && image.naturalWidth > 0 && image.naturalHeight > 0
+        );
+      };
+
+      Array.from(document.images).forEach((image) => {
+        if (isImageReady(image)) {
+          return;
+        }
+
+        const src = image.getAttribute('src');
+        const srcset = image.getAttribute('srcset');
+        const currentSrc = image.currentSrc || image.src;
+
+        if (!src && !srcset && !currentSrc) {
+          return;
+        }
+
+        image.loading = 'eager';
+        image.decoding = 'sync';
+
+        // 通过移除再恢复 src/srcset，让浏览器重新请求或重新解码图片。
+        if (srcset) {
+          image.removeAttribute('srcset');
+        }
+        if (src) {
+          image.removeAttribute('src');
+        }
+
+        void image.offsetHeight;
+
+        if (src) {
+          image.setAttribute('src', src);
+        } else if (currentSrc) {
+          image.src = currentSrc;
+        }
+        if (srcset) {
+          image.setAttribute('srcset', srcset);
+        }
+      });
+
+      Array.from(document.querySelectorAll('video')).forEach((video) => {
+        if (video.readyState >= 2) {
+          return;
+        }
+
+        video.preload = 'auto';
+        try {
+          // load() 会重新选择并加载当前 video source。
+          video.load();
+        } catch (e) {
+          // Ignore retry failures here; collectMediaLoadStatus reports them.
+        }
+      });
+    });
+  }
+
+  private formatMediaFailureSummary(failures: UrlPdfMediaFailure[]): string {
+    const imageCount = failures.filter((item) => item.type === 'image').length;
+    const videoCount = failures.filter((item) => item.type === 'video').length;
+    const samples = failures.slice(0, 5).map((item) => {
+      return `${item.type}:${item.reason}:${item.url}`;
+    });
+
+    return `total=${
+      failures.length
+    }, image=${imageCount}, video=${videoCount}, samples=${JSON.stringify(
+      samples,
+    )}`;
   }
 }
