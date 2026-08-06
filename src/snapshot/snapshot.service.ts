@@ -6,7 +6,13 @@ import {
   Scope,
 } from '@nestjs/common';
 import puppeteer from 'puppeteer-extra';
-import { Browser, Page, PDFOptions } from 'puppeteer';
+import {
+  Browser,
+  HTTPRequest,
+  HTTPResponse,
+  Page,
+  PDFOptions,
+} from 'puppeteer';
 import JSZip from 'jszip';
 import { SnapshotOptionDto } from './../core/interfaces/requestDto';
 import { UrlPdfItem } from './snapshot.interface';
@@ -21,6 +27,27 @@ interface UrlPdfMediaLoadStatus {
   total: number;
   loaded: number;
   failed: UrlPdfMediaFailure[];
+}
+
+interface UrlPdfNetworkMonitor {
+  pending: Set<HTTPRequest>;
+  failures: Set<string>;
+  lastActivityAt: number;
+  logLabel: string;
+  dispose: () => void;
+}
+
+interface UrlPdfPageStableState {
+  width: number;
+  height: number;
+  mediaCount: number;
+}
+
+interface UrlPdfVisualSettleStatus {
+  transitionNodes: number;
+  finiteAnimations: number;
+  elapsedMs: number;
+  timedOut: boolean;
 }
 
 /**
@@ -49,7 +76,7 @@ export class SnapshotService {
 
   // urlToPdf 批量导出默认等待预算：
   // 1. 滚动触发懒加载：最多 20 轮 * 800ms，连续 4 轮稳定后提前结束。
-  // 2. 网络空闲：等待 800ms idle，最多等 3200ms。
+  // 2. 页面资源等待：每次 pending 清零后持续 1200ms 才算稳定，整体最多 60s。
   // 3. 图片/视频：首次检查 + 3 次重试，每轮媒体等待最多 3200ms。
   private readonly urlPdfLoadOptions: SnapshotOptionDto = {
     scrollTimes: 20,
@@ -59,6 +86,29 @@ export class SnapshotService {
   };
 
   private readonly urlPdfMediaRetryTimes = 3;
+
+  private readonly urlPdfNetworkIdleTime = 1200;
+
+  private readonly urlPdfReadyTimeout = 60 * 1000;
+
+  private readonly urlPdfRenderRetryTimes = 1;
+
+  private readonly urlPdfDomStableRounds = 3;
+
+  private readonly urlPdfDomStableInterval = 200;
+
+  private readonly urlPdfVisualSettleTimeout = 3000;
+
+  private readonly urlPdfTrackedResourceTypes = new Set([
+    'document',
+    'stylesheet',
+    'script',
+    'xhr',
+    'fetch',
+    'image',
+    'media',
+    'font',
+  ]);
 
   /**
    * 浏览器实例
@@ -71,6 +121,9 @@ export class SnapshotService {
   private page: Page;
 
   private isRunning = false;
+
+  // Chromium 同一时刻只有一个前台 Page；用队列串行化最终视觉渲染和 PDF 打印。
+  private urlPdfVisualRenderQueue: Promise<void> = Promise.resolve();
 
   private readonly logger = new Logger(SnapshotService.name);
 
@@ -201,7 +254,9 @@ export class SnapshotService {
       const batchResults = await Promise.all(
         currentTasks.map((task) =>
           task().catch((e) => {
-            this.logger.error('PDF生成任务失败:', e);
+            this.logger.error(
+              `PDF生成任务失败: ${this.getUrlPdfSafeErrorSummary(e)}`,
+            );
             throw e;
           }),
         ),
@@ -223,6 +278,8 @@ export class SnapshotService {
     }[],
     zipName?: string,
   ): Promise<UrlPdfItem> {
+    const batchStartedAt = Date.now();
+
     try {
       // 1. 参数校验：没有 URL 时不启动浏览器，直接返回请求错误。
       if (config.length === 0) {
@@ -231,6 +288,10 @@ export class SnapshotService {
           HttpStatus.BAD_REQUEST,
         );
       }
+
+      this.logger.log(
+        `[urlToPdf] 批次开始: pages=${config.length}, concurrency=${this.urlPdfMaxConcurrent}`,
+      );
 
       // 2. 初始化本次请求专用的 Chromium；本次请求内 newPage 共享同一个 browser context。
       await this.init();
@@ -242,6 +303,11 @@ export class SnapshotService {
 
       // 4. 默认最多 10 个页面并发；可用 SNAPSHOT_URL_PDF_CONCURRENCY 调小。
       const res = await this.sliceTasks(tasks, this.urlPdfMaxConcurrent);
+      this.logger.log(
+        `[urlToPdf] 页面渲染完成: pages=${res.length}, elapsedMs=${
+          Date.now() - batchStartedAt
+        }`,
+      );
 
       // 5. 输出规则：单个 PDF 直接返回；多个 PDF 或传入 zipName 时打包为 ZIP。
       if (!res.length) {
@@ -271,7 +337,11 @@ export class SnapshotService {
         };
       }
     } catch (e) {
-      this.logger.error('urlToPdf - failed', e);
+      this.logger.error(
+        `[urlToPdf] 批次失败: elapsedMs=${
+          Date.now() - batchStartedAt
+        }, error=${this.getUrlPdfSafeErrorSummary(e)}`,
+      );
       throw new HttpException(e, HttpStatus.INTERNAL_SERVER_ERROR);
     } finally {
       // 6. 请求结束后关闭浏览器，避免 localStorage/token 在不同请求之间残留。
@@ -290,22 +360,79 @@ export class SnapshotService {
     },
     index: number,
   ): Promise<UrlPdfItem> {
+    let lastError: unknown;
+    const logLabel = this.getUrlPdfLogLabel(item.name, index);
+
+    // 资源等待失败时使用全新的 page 完整重试一次，避免复用已进入异常状态的页面。
+    for (
+      let attempt = 0;
+      attempt <= this.urlPdfRenderRetryTimes;
+      attempt += 1
+    ) {
+      const attemptStartedAt = Date.now();
+      this.logger.debug(
+        `${logLabel} 开始渲染: attempt=${attempt + 1}/${
+          this.urlPdfRenderRetryTimes + 1
+        }`,
+      );
+
+      try {
+        const result = await this.renderUrlPdfItemOnce(item, index, logLabel);
+        this.logger.log(
+          `${logLabel} 渲染成功: attempt=${attempt + 1}, elapsedMs=${
+            Date.now() - attemptStartedAt
+          }, pdfBytes=${result.buffer.length}`,
+        );
+        return result;
+      } catch (e) {
+        lastError = e;
+        this.logger.warn(
+          `${logLabel} 渲染失败: attempt=${attempt + 1}, elapsedMs=${
+            Date.now() - attemptStartedAt
+          }, error=${this.getUrlPdfSafeErrorSummary(e)}`,
+        );
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async renderUrlPdfItemOnce(
+    item: {
+      url: string;
+      name: string;
+      option: PDFOptions;
+    },
+    index: number,
+    logLabel = this.getUrlPdfLogLabel(item.name, index),
+  ): Promise<UrlPdfItem> {
     // 每个 URL 单独打开一个 page；并发时这些 page 会同时共享同一个 browser。
     const page = await this.browser.newPage();
+    // 必须在 goto 前开始监听，否则会漏掉页面初始化阶段发出的接口和资源请求。
+    const networkMonitor = this.createUrlPdfNetworkMonitor(page, logLabel);
 
     try {
       // 页面脚本初始化：禁用 unload/dialog 干扰，并设置 PDF 基础 viewport。
       await this.initPage(page);
       await this.initPdfViewport(page);
 
-      // 首次导航只等 window load，最长 60s；懒加载、网络空闲和媒体加载在 waitPageLoaded 中处理。
+      // 首次导航只等 window load，最长 60s；后续由严格就绪流程处理懒加载、网络和媒体。
       await page.goto(item.url, {
         timeout: 60 * 1000,
         waitUntil: ['load'],
       });
+      this.logger.debug(`${logLabel} 页面 load 事件完成`);
 
-      // 页面稳定等待：默认约 3.2-16s 滚动 + 最多 3.2s 网络空闲 + 最多约 12.8s 媒体等待。
-      await this.waitPageLoaded(page, this.urlPdfLoadOptions);
+      const readyDeadlineAt = Date.now() + this.urlPdfReadyTimeout;
+
+      // 先等待主数据请求结束，再滚动触发懒加载，最后严格等待网络、媒体和页面尺寸稳定。
+      await this.waitUrlPdfPageReady(
+        page,
+        networkMonitor,
+        readyDeadlineAt,
+        this.urlPdfLoadOptions,
+      );
+      this.logger.debug(`${logLabel} 首轮页面就绪检查完成`);
 
       // 懒加载完成后再测量页面尺寸，避免 PDF 高度少算。
       let { width: bodyWidth, height: bodyHeight } =
@@ -313,30 +440,65 @@ export class SnapshotService {
 
       if (bodyWidth > this.getViewportWidth(page)) {
         // 宽页面需要扩展 viewport；扩展后可能触发响应式布局和新的懒加载，所以再等一次。
+        this.logger.debug(
+          `${logLabel} 扩展 viewport: from=${this.getViewportWidth(
+            page,
+          )}, to=${Math.ceil(bodyWidth)}`,
+        );
         await this.expandPdfViewport(page, bodyWidth);
-        await this.waitPageLoaded(page, this.urlPdfLoadOptions);
+        await this.waitUrlPdfPageReady(
+          page,
+          networkMonitor,
+          readyDeadlineAt,
+          this.urlPdfLoadOptions,
+        );
         ({ width: bodyWidth, height: bodyHeight } =
           await this.getPageDimensions(page));
+        this.logger.debug(`${logLabel} viewport 变更后的就绪检查完成`);
       }
 
-      // 未指定 format 时，按完整页面像素尺寸输出；调用方传入的 PDFOptions 优先。
-      const pdfConfig: PDFOptions = {
-        printBackground: true,
-        preferCSSPageSize: false,
-        ...item.option,
-      };
+      const pdfBuffer = await this.runWithUrlPdfVisualRenderLock(
+        logLabel,
+        async () => {
+          // 批量场景下后台 Page 的 requestAnimationFrame 会暂停；切到前台后推进过渡帧。
+          await this.waitForUrlPdfVisualSettled(
+            page,
+            readyDeadlineAt,
+            logLabel,
+          );
 
-      if (!pdfConfig.format) {
-        if (pdfConfig.width === undefined) {
-          pdfConfig.width = `${bodyWidth}px`;
-        }
-        if (pdfConfig.height === undefined) {
-          pdfConfig.height = `${bodyHeight}px`;
-        }
-      }
+          // 视觉过渡可能改变布局；前台稳定后重新执行最终闸门并重新测量 PDF 尺寸。
+          await this.waitUrlPdfFinalReady(
+            page,
+            networkMonitor,
+            readyDeadlineAt,
+          );
+          ({ width: bodyWidth, height: bodyHeight } =
+            await this.getPageDimensions(page));
 
-      // 图片/视频三次重试后仍失败只记录日志，不阻断 PDF 输出。
-      const pdfBuffer = await page.pdf(pdfConfig);
+          // 未指定 format 时，按最终完整页面像素尺寸输出；调用方传入的 PDFOptions 优先。
+          const pdfConfig: PDFOptions = {
+            printBackground: true,
+            preferCSSPageSize: false,
+            ...item.option,
+          };
+
+          if (!pdfConfig.format) {
+            if (pdfConfig.width === undefined) {
+              pdfConfig.width = `${bodyWidth}px`;
+            }
+            if (pdfConfig.height === undefined) {
+              pdfConfig.height = `${bodyHeight}px`;
+            }
+          }
+
+          this.logger.debug(
+            `${logLabel} PDF 前最终闸门通过: width=${bodyWidth}, height=${bodyHeight}`,
+          );
+          // 必须在仍持有视觉锁时打印，防止其他 Page 抢到前台后再次暂停当前渲染。
+          return await page.pdf(pdfConfig);
+        },
+      );
 
       return {
         name: `${index + 1}.${item.name}.pdf`,
@@ -347,11 +509,68 @@ export class SnapshotService {
       };
     } finally {
       // 无论成功或失败都关闭当前 page，避免批量导出时页面句柄泄漏。
+      networkMonitor.dispose();
       if (!page.isClosed()) {
         await page.close();
       }
     }
   }
+
+  /**
+   * 构造单页日志标识。文件名会清理换行并限制长度，避免批量日志被用户输入打断。
+   */
+  private getUrlPdfLogLabel(name: string, index: number): string {
+    const safeName = String(name || '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .slice(0, 120);
+    return `[urlToPdf][page=${index + 1}][name=${safeName}]`;
+  }
+
+  /**
+   * 日志中保留错误类型和原因，但隐藏完整 URL、token 等敏感信息。
+   */
+  private getUrlPdfSafeErrorSummary(error: unknown): string {
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const safeMessage = rawMessage
+      .replace(/https?:\/\/[^\s)\]}]+/gi, '[URL已隐藏]')
+      .replace(
+        /((?:token|access_token|authorization)\s*[=:]\s*)[^\s,;&]+/gi,
+        '$1***',
+      )
+      .replace(/[\r\n\t]+/g, ' ')
+      .slice(0, 500);
+
+    return `${errorName}: ${safeMessage}`;
+  }
+
+  /**
+   * 将最终视觉稳定和 page.pdf 串行执行。网络和媒体仍可并发加载，只有依赖前台状态的阶段排队。
+   */
+  private async runWithUrlPdfVisualRenderLock<T>(
+    logLabel: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    const queuedAt = Date.now();
+    const previousTask = this.urlPdfVisualRenderQueue;
+    let release: () => void = () => undefined;
+    this.urlPdfVisualRenderQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previousTask;
+    this.logger.debug(
+      `${logLabel} 获得最终渲染锁: queueWaitMs=${Date.now() - queuedAt}`,
+    );
+
+    try {
+      return await task();
+    } finally {
+      // 无论视觉检查或 PDF 打印是否失败，都必须释放后续页面。
+      release();
+    }
+  }
+
   private async createZipBuffer(
     results: { name: string; buffer: Buffer }[],
   ): Promise<Buffer> {
@@ -521,21 +740,391 @@ export class SnapshotService {
     });
   }
 
-  // private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
-  //   const scrollDelay = options?.scrollDelay || 1000;
-  //   const maxScrollTimes = options?.scrollTimes || 20;
+  /**
+   * 从导航前开始维护有限 HTTP 资源的 pending/failed 集合。
+   * requestfinished 和 requestfailed 都会结束 pending；HTTP 4xx/5xx 另外记为失败。
+   */
+  private createUrlPdfNetworkMonitor(
+    page: Page,
+    logLabel = '[urlToPdf]',
+  ): UrlPdfNetworkMonitor {
+    const monitor: UrlPdfNetworkMonitor = {
+      pending: new Set(),
+      failures: new Set(),
+      lastActivityAt: Date.now(),
+      logLabel,
+      dispose: () => undefined,
+    };
 
-  //   // 滚动加载
-  //   for (let i = 0; i < maxScrollTimes; i++) {
-  //     await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-  //     await page.waitForTimeout(scrollDelay);
-  //   }
+    const touch = () => {
+      monitor.lastActivityAt = Date.now();
+    };
+    const onRequest = (request: HTTPRequest) => {
+      if (!this.isTrackedUrlPdfRequest(request)) {
+        return;
+      }
 
-  //   // 等待网络空闲
-  //   await page.waitForNetworkIdle({ idleTime: 500, timeout: 30000 });
-  // }
+      // 使用 HTTPRequest 实例作为 Set key，可正确区分同一 URL 的并发请求。
+      monitor.pending.add(request);
+      touch();
+    };
+    const onRequestFinished = (request: HTTPRequest) => {
+      if (monitor.pending.delete(request)) {
+        touch();
+      }
+    };
+    const onRequestFailed = (request: HTTPRequest) => {
+      if (!monitor.pending.has(request)) {
+        return;
+      }
 
-  private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
+      monitor.pending.delete(request);
+      monitor.failures.add(this.getUrlPdfRequestKey(request));
+      touch();
+    };
+    const onResponse = (response: HTTPResponse) => {
+      const request = response.request();
+      if (!this.isTrackedUrlPdfRequest(request)) {
+        return;
+      }
+
+      const key = this.getUrlPdfRequestKey(request);
+      if (response.status() >= 400) {
+        monitor.failures.add(key);
+      } else {
+        // 同一资源后续重试成功时，清除之前记录的瞬时失败。
+        monitor.failures.delete(key);
+      }
+      touch();
+    };
+
+    page.on('request', onRequest);
+    page.on('requestfinished', onRequestFinished);
+    page.on('requestfailed', onRequestFailed);
+    page.on('response', onResponse);
+
+    monitor.dispose = () => {
+      // Page 关闭前主动解绑，避免重试时旧监听器和请求状态残留。
+      page.off('request', onRequest);
+      page.off('requestfinished', onRequestFinished);
+      page.off('requestfailed', onRequestFailed);
+      page.off('response', onResponse);
+      monitor.pending.clear();
+    };
+
+    return monitor;
+  }
+
+  private isTrackedUrlPdfRequest(request: HTTPRequest): boolean {
+    const resourceType = request.resourceType();
+    if (!this.urlPdfTrackedResourceTypes.has(resourceType)) {
+      return false;
+    }
+
+    const url = request.url();
+    if (/^(?:data|blob|about):/i.test(url)) {
+      return false;
+    }
+
+    // favicon 不影响 PDF 内容，并且目标页面当前会返回 404，避免它阻断整批导出。
+    return !/\/favicon(?:\.[^/?#]+)?(?:[?#].*)?$/i.test(url);
+  }
+
+  private getUrlPdfRequestKey(request: HTTPRequest): string {
+    return `${request.resourceType()}:${request.method()}:${request.url()}`;
+  }
+
+  private async waitUrlPdfPageReady(
+    page: Page,
+    monitor: UrlPdfNetworkMonitor,
+    deadlineAt: number,
+    options: SnapshotOptionDto,
+  ): Promise<void> {
+    // 先等待页面主数据和附件元数据请求结束，避免 DOM 中的 img 尚未创建。
+    await this.waitForUrlPdfNetworkSettled(monitor, deadlineAt);
+    await this.scrollPageForLazyResources(
+      page,
+      options,
+      deadlineAt,
+      monitor.logLabel,
+    );
+    await this.waitUrlPdfFinalReady(page, monitor, deadlineAt);
+  }
+
+  /**
+   * 将当前 Page 切到前台并推进浏览器绘制帧，等待有限动画和 Vue/Element 过渡节点退出。
+   * 批量打开 Page 时后台页的 requestAnimationFrame 可能暂停，仅检查 Network/img.complete 不足以
+   * 证明图片已经进入最终布局。
+   */
+  private async waitForUrlPdfVisualSettled(
+    page: Page,
+    deadlineAt: number,
+    logLabel: string,
+  ): Promise<void> {
+    this.assertUrlPdfReadyDeadline(deadlineAt);
+    const timeout = Math.max(
+      Math.min(this.urlPdfVisualSettleTimeout, deadlineAt - Date.now()),
+      1,
+    );
+
+    await page.bringToFront();
+    const evaluateTask = page.evaluate(async (timeoutMs) => {
+      const startedAt = performance.now();
+      const waitFrame = () => {
+        return new Promise<void>((resolve) => {
+          requestAnimationFrame(() => resolve());
+        });
+      };
+      const wait = (ms: number) => {
+        return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+      };
+      const getTransitionNodeCount = () => {
+        return document.querySelectorAll(
+          '[class*="-leave-active"], [class*="-enter-active"]',
+        ).length;
+      };
+      const getFiniteRunningAnimations = () => {
+        return document.getAnimations().filter((animation) => {
+          const timing = animation.effect?.getComputedTiming();
+          return (
+            animation.playState !== 'finished' &&
+            animation.playState !== 'idle' &&
+            Number.isFinite(Number(timing?.endTime))
+          );
+        });
+      };
+
+      let finiteAnimationCount = 0;
+      while (performance.now() - startedAt < timeoutMs) {
+        // Vue Transition 使用连续两个 requestAnimationFrame 切换 from/to class。
+        await waitFrame();
+        await waitFrame();
+
+        const animations = getFiniteRunningAnimations();
+        finiteAnimationCount = Math.max(
+          finiteAnimationCount,
+          animations.length,
+        );
+        if (animations.length > 0) {
+          const remainingTime = Math.max(
+            timeoutMs - (performance.now() - startedAt),
+            1,
+          );
+          await Promise.race([
+            Promise.all(
+              animations.map((animation) =>
+                animation.finished.catch(() => undefined),
+              ),
+            ),
+            wait(remainingTime),
+          ]);
+        }
+
+        // transitionend 后 Vue 还需要一个绘制帧移除离场节点。
+        await waitFrame();
+        const transitionNodes = getTransitionNodeCount();
+        if (
+          transitionNodes === 0 &&
+          getFiniteRunningAnimations().length === 0
+        ) {
+          return {
+            transitionNodes,
+            finiteAnimations: finiteAnimationCount,
+            elapsedMs: Math.round(performance.now() - startedAt),
+            timedOut: false,
+          };
+        }
+
+        await wait(50);
+      }
+
+      return {
+        transitionNodes: getTransitionNodeCount(),
+        finiteAnimations: finiteAnimationCount,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        timedOut: true,
+      };
+    }, timeout);
+
+    // Node 侧也设置超时，避免 Page 再次失去前台时 requestAnimationFrame 永久不返回。
+    const status = await new Promise<UrlPdfVisualSettleStatus>(
+      (resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          reject(new Error('页面视觉渲染等待超时'));
+        }, timeout + 250);
+
+        void evaluateTask.then(
+          (result) => {
+            clearTimeout(timeoutId);
+            resolve(result as UrlPdfVisualSettleStatus);
+          },
+          (error) => {
+            clearTimeout(timeoutId);
+            reject(error);
+          },
+        );
+      },
+    );
+
+    if (status.timedOut || status.transitionNodes > 0) {
+      this.logger.warn(
+        `${logLabel} 页面视觉渲染未完成: transitionNodes=${status.transitionNodes}, finiteAnimations=${status.finiteAnimations}, elapsedMs=${status.elapsedMs}`,
+      );
+      throw new Error(
+        `页面视觉渲染等待超时：仍有 ${status.transitionNodes} 个过渡节点`,
+      );
+    }
+
+    this.logger.debug(
+      `${logLabel} 页面视觉渲染已稳定: finiteAnimations=${status.finiteAnimations}, elapsedMs=${status.elapsedMs}`,
+    );
+  }
+
+  /**
+   * PDF 就绪闸门：网络稳定 -> 媒体完成 -> 网络再次稳定 -> DOM 稳定 -> 最终网络稳定。
+   * 媒体重试和 Vue 渲染都可能产生新请求，因此不能只检查一次 network idle。
+   */
+  private async waitUrlPdfFinalReady(
+    page: Page,
+    monitor: UrlPdfNetworkMonitor,
+    deadlineAt: number,
+  ): Promise<void> {
+    await this.waitForUrlPdfNetworkSettled(monitor, deadlineAt);
+    await this.waitMediaLoaded(
+      page,
+      this.urlPdfMediaRetryTimes,
+      Math.max(this.urlPdfLoadOptions.scrollDelay * 4, 3000),
+      true,
+      deadlineAt,
+      monitor.logLabel,
+    );
+    // 媒体重试可能重新发起请求，因此媒体检查后必须再次等待 pending 清零。
+    await this.waitForUrlPdfNetworkSettled(monitor, deadlineAt);
+    await this.waitForUrlPdfDomStable(page, deadlineAt, monitor.logLabel);
+    // DOM 稳定期间仍可能调度请求，page.pdf 前再执行最后一次网络闸门。
+    await this.waitForUrlPdfNetworkSettled(monitor, deadlineAt);
+    this.assertUrlPdfNetworkSucceeded(monitor);
+    this.logger.debug(
+      `${monitor.logLabel} 最终就绪闸门通过: pending=${monitor.pending.size}, failed=${monitor.failures.size}`,
+    );
+  }
+
+  /**
+   * pending 清零后必须持续 idleTime 无新活动才返回；deadlineAt 是整页共享的总预算。
+   */
+  private async waitForUrlPdfNetworkSettled(
+    monitor: UrlPdfNetworkMonitor,
+    deadlineAt: number,
+    idleTime = this.urlPdfNetworkIdleTime,
+  ): Promise<void> {
+    while (Date.now() < deadlineAt) {
+      const now = Date.now();
+      if (
+        monitor.pending.size === 0 &&
+        now - monitor.lastActivityAt >= idleTime
+      ) {
+        this.logger.debug(
+          `${monitor.logLabel} Network 已稳定: pending=0, idleMs=${
+            now - monitor.lastActivityAt
+          }, failed=${monitor.failures.size}`,
+        );
+        return;
+      }
+
+      const remainingTime = deadlineAt - now;
+      const remainingIdleTime = Math.max(
+        idleTime - (now - monitor.lastActivityAt),
+        1,
+      );
+      await this.sleep(Math.min(50, remainingTime, remainingIdleTime));
+    }
+
+    this.logger.warn(
+      `${monitor.logLabel} Network 等待超时: pending=${monitor.pending.size}, failed=${monitor.failures.size}`,
+    );
+    throw new Error(
+      `页面资源等待超时：仍有 ${monitor.pending.size} 个请求未结束`,
+    );
+  }
+
+  private assertUrlPdfNetworkSucceeded(monitor: UrlPdfNetworkMonitor): void {
+    if (monitor.failures.size > 0) {
+      this.logger.warn(
+        `${monitor.logLabel} 关键资源请求失败: failed=${monitor.failures.size}`,
+      );
+      throw new Error(`页面存在 ${monitor.failures.size} 个关键资源请求失败`);
+    }
+  }
+
+  /**
+   * 连续多轮比较页面宽高和媒体元素数量，防止请求完成后 Vue/DOM 尚未完成下一轮渲染。
+   */
+  private async waitForUrlPdfDomStable(
+    page: Page,
+    deadlineAt: number,
+    logLabel = '[urlToPdf]',
+  ): Promise<void> {
+    let previousState = await this.getUrlPdfPageStableState(page);
+    let stableRounds = 0;
+
+    while (stableRounds < this.urlPdfDomStableRounds) {
+      this.assertUrlPdfReadyDeadline(deadlineAt);
+      await this.sleep(
+        Math.min(this.urlPdfDomStableInterval, deadlineAt - Date.now()),
+      );
+
+      const currentState = await this.getUrlPdfPageStableState(page);
+      if (
+        currentState.width === previousState.width &&
+        currentState.height === previousState.height &&
+        currentState.mediaCount === previousState.mediaCount
+      ) {
+        stableRounds += 1;
+      } else {
+        stableRounds = 0;
+      }
+      previousState = currentState;
+    }
+
+    this.logger.debug(
+      `${logLabel} DOM 已稳定: width=${previousState.width}, height=${previousState.height}, media=${previousState.mediaCount}`,
+    );
+  }
+
+  private async getUrlPdfPageStableState(
+    page: Page,
+  ): Promise<UrlPdfPageStableState> {
+    return await page.evaluate(() => {
+      const body = document.body;
+      const documentElement = document.documentElement;
+
+      return {
+        width: Math.max(
+          body?.scrollWidth || 0,
+          documentElement?.scrollWidth || 0,
+        ),
+        height: Math.max(
+          body?.scrollHeight || 0,
+          documentElement?.scrollHeight || 0,
+        ),
+        mediaCount:
+          document.images.length + document.querySelectorAll('video').length,
+      };
+    });
+  }
+
+  private assertUrlPdfReadyDeadline(deadlineAt: number): void {
+    if (Date.now() >= deadlineAt) {
+      throw new Error('页面资源等待超时');
+    }
+  }
+
+  private async scrollPageForLazyResources(
+    page: Page,
+    options?: SnapshotOptionDto,
+    deadlineAt?: number,
+    logLabel = '[urlToPdf]',
+  ): Promise<void> {
     const maxScrollTimes = options?.scrollTimes || 20;
     const minStableScrollRounds = Math.max(options?.minScrollTimes || 5, 1);
     const scrollDelay = options?.scrollDelay || 1000;
@@ -544,8 +1133,12 @@ export class SnapshotService {
     let stableScrollRounds = 0;
     let previousState = await this.getPageScrollState(page);
 
-    // 先向下滚动触发图片、视频、列表等懒加载内容；默认最多 20 轮，每轮等待 800ms。
+    // 逐段滚动触发图片、视频和列表懒加载；到底且高度连续稳定后提前停止。
     while (scrollCount < maxScrollTimes) {
+      if (deadlineAt !== undefined) {
+        this.assertUrlPdfReadyDeadline(deadlineAt);
+      }
+
       await page.evaluate((offset) => {
         window.scrollBy(0, offset);
       }, scrollOffset);
@@ -559,7 +1152,6 @@ export class SnapshotService {
         currentState.height - 2;
       const scrollStuck = currentState.scrollTop === previousState.scrollTop;
 
-      // 页面高度不再变化且已到底部/滚不动时记为稳定；默认连续 4 轮稳定后提前结束。
       if (heightStable && (reachedBottom || scrollStuck)) {
         stableScrollRounds += 1;
       } else {
@@ -577,6 +1169,33 @@ export class SnapshotService {
     await page.evaluate(() => {
       window.scrollTo(0, 0);
     });
+    this.logger.debug(
+      `${logLabel} 懒加载滚动完成: rounds=${scrollCount}, stableRounds=${stableScrollRounds}`,
+    );
+  }
+
+  // private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
+  //   const scrollDelay = options?.scrollDelay || 1000;
+  //   const maxScrollTimes = options?.scrollTimes || 20;
+
+  //   // 滚动加载
+  //   for (let i = 0; i < maxScrollTimes; i++) {
+  //     await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+  //     await page.waitForTimeout(scrollDelay);
+  //   }
+
+  //   // 等待网络空闲
+  //   await page.waitForNetworkIdle({ idleTime: 500, timeout: 30000 });
+  // }
+
+  private async waitPageLoaded(page: Page, options?: SnapshotOptionDto) {
+    const scrollDelay = options?.scrollDelay || 1000;
+    await this.scrollPageForLazyResources(
+      page,
+      options,
+      undefined,
+      '[URL2PDF]',
+    );
     try {
       // 滚动结束后等一次短网络空闲；默认等 800ms idle，最多等 3200ms，超时只告警。
       await page.waitForNetworkIdle({
@@ -605,24 +1224,52 @@ export class SnapshotService {
     page: Page,
     retryTimes = 3,
     timeout = 3000,
+    strict = false,
+    deadlineAt?: number,
+    logLabel = '[urlToPdf]',
   ): Promise<void> {
     // 首轮只检查当前媒体状态；都已加载时立即返回，不额外等待。
-    let status = await this.collectMediaLoadStatus(page, timeout);
+    let status = await this.collectMediaLoadStatus(
+      page,
+      this.getUrlPdfMediaWaitTimeout(timeout, deadlineAt),
+    );
+    if (status.failed.length === 0) {
+      if (strict) {
+        this.logger.debug(
+          `${logLabel} 媒体资源已就绪: loaded=${status.loaded}, total=${status.total}`,
+        );
+      }
+      return;
+    }
 
     for (let retryIndex = 1; retryIndex <= retryTimes; retryIndex += 1) {
-      if (status.failed.length === 0) {
-        return;
-      }
-
       this.logger.warn(
         `waitMediaLoaded - retry ${retryIndex}/${retryTimes}, failed ${status.failed.length}/${status.total}`,
       );
       // 对仍失败的 img/video 发起重试，然后再次等待其完成。
       await this.retryFailedMedia(page);
-      status = await this.collectMediaLoadStatus(page, timeout);
+      status = await this.collectMediaLoadStatus(
+        page,
+        this.getUrlPdfMediaWaitTimeout(timeout, deadlineAt),
+      );
+      if (status.failed.length === 0) {
+        if (strict) {
+          this.logger.debug(
+            `${logLabel} 媒体资源重试成功: retry=${retryIndex}, loaded=${status.loaded}, total=${status.total}`,
+          );
+        }
+        return;
+      }
     }
 
     if (status.failed.length > 0) {
+      if (strict) {
+        this.logger.warn(
+          `${logLabel} 媒体资源加载失败: failed=${status.failed.length}, total=${status.total}`,
+        );
+        throw new Error(`页面存在 ${status.failed.length} 个媒体资源加载失败`);
+      }
+
       // 三次重试后仍失败只记录资源类型、数量和样例 URL，不 throw，继续生成 PDF。
       this.logger.error(
         `waitMediaLoaded - media failed after ${retryTimes} retries: ${this.formatMediaFailureSummary(
@@ -630,6 +1277,18 @@ export class SnapshotService {
         )}`,
       );
     }
+  }
+
+  private getUrlPdfMediaWaitTimeout(
+    timeout: number,
+    deadlineAt?: number,
+  ): number {
+    if (deadlineAt === undefined) {
+      return timeout;
+    }
+
+    this.assertUrlPdfReadyDeadline(deadlineAt);
+    return Math.max(Math.min(timeout, deadlineAt - Date.now()), 1);
   }
 
   private async collectMediaLoadStatus(
