@@ -10,7 +10,7 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10.6.5
 
 RUN apt-get update -y
 
@@ -67,7 +67,7 @@ COPY package*.json ./
 COPY pnpm-lock.yaml .
 COPY .npmrc .
 
-RUN pnpm i
+RUN pnpm install --frozen-lockfile
 
 COPY . ./
 
