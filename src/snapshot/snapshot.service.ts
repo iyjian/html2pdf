@@ -225,11 +225,10 @@ export class SnapshotService {
 
       return Buffer.from(pdfBuffer);
     } catch (e) {
-      console.log(e);
-      throw new HttpException(
-        '系统错误：未能生成PDF',
-        HttpStatus.INTERNAL_SERVER_ERROR,
+      this.logger.error(
+        `URL2PDF 生成失败: ${this.getUrlPdfSafeErrorSummary(e)}`,
       );
+      throw e;
     } finally {
       if (this.browser?.connected) {
         const pages = await this.browser.pages();

@@ -1,4 +1,13 @@
-import { Body, Controller, Get, Param, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpException,
+  HttpStatus,
+  Param,
+  Post,
+  Res,
+} from '@nestjs/common';
 import { SnapshotService } from './snapshot.service';
 import { Response } from 'express';
 import { PDFOptions } from 'puppeteer';
@@ -29,14 +38,26 @@ export class SnapshotController {
     @Res() res: Response,
   ) {
     try {
+      const result = await this.snapshotService.URL2PDF(url, pdfOption);
       res.set('Content-Type', 'application/x-pdf');
       res.set('Content-Disposition', `attachment;filename=${fileName}`);
-      const result = await this.snapshotService.URL2PDF(url, pdfOption);
       res.send(result);
       return true;
     } catch (e) {
-      console.log(e);
-      return true;
+      const status =
+        e instanceof HttpException
+          ? e.getStatus()
+          : HttpStatus.INTERNAL_SERVER_ERROR;
+      const response =
+        e instanceof HttpException ? e.getResponse() : '系统错误：未能生成PDF';
+      const errMsg =
+        typeof response === 'string'
+          ? response
+          : Array.isArray(response['message'])
+          ? response['message'].join(', ')
+          : String(response['message'] || 'internal error');
+
+      res.status(status).json({ err: status, errMsg });
     }
   }
 
