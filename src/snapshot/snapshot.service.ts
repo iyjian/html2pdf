@@ -134,7 +134,9 @@ export class SnapshotService {
       // puppeteer.use(StealthPlugin());
 
       this.browser = await puppeteer.launch({
-        headless: true,
+        // macOS 的新版 Headless Chrome 在部分环境中会生成不含字体的空白 PDF。
+        // 使用 Puppeteer 随包安装的 chrome-headless-shell，避免走该 PDF 字体渲染路径。
+        headless: 'shell',
         devtools: debug,
         /**
          * 语言设置
@@ -153,9 +155,6 @@ export class SnapshotService {
           '--font-render-hinting=none',
         ],
         defaultViewport: null,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-        // executablePath: path.join(__dirname, './../../chrome-linux/chrome'),
-        // executablePath: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
       });
       this.logger.debug(`init - new browser`);
     }

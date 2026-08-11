@@ -6,9 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ENV NODE_ENV=development
 
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# 依赖安装阶段不下载浏览器；下面会显式下载唯一需要的 chrome-headless-shell。
+ENV PUPPETEER_CHROME_SKIP_DOWNLOAD=true
+ENV PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD=true
+ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
 RUN npm install -g pnpm@10.6.5
 
@@ -55,8 +56,6 @@ RUN apt-get install -y   ca-certificates \
                                       xdg-utils
 
 RUN apt-get install -y fontconfig xfonts-utils
-RUN apt-get install -y chromium chromium-driver
-
 WORKDIR /app
 
 COPY fonts/* /usr/share/fonts/
@@ -68,6 +67,11 @@ COPY pnpm-lock.yaml .
 COPY .npmrc .
 
 RUN pnpm install --frozen-lockfile
+
+# 在镜像构建时下载 PDF 渲染使用的浏览器，运行期不需要联网下载。
+# 此处临时解除 shell 的安装跳过配置，仅影响这一条显式安装命令。
+RUN PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD=false \
+    pnpm exec puppeteer browsers install chrome-headless-shell
 
 COPY . ./
 
