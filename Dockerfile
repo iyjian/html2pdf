@@ -1,6 +1,6 @@
-FROM node:22.16.0-bullseye AS base
+FROM node:22.16.0-bookworm AS base
 
-ENV TZ=Asia/Shanghai 
+ENV TZ=Asia/Shanghai
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -13,49 +13,55 @@ ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
 RUN npm install -g pnpm@10.6.5
 
-RUN apt-get update -y
+# Debian bullseye 已于 2026-08-31 结束 LTS：bullseye-security 的 Packages 索引仍在，
+# 但对应的 deb 包已从 deb.debian.org 下架，apt-get update 能过、apt-get install 却会
+# 因 404 失败并返回 exit code 100。这里改用仍在维护的 bookworm（Debian 12），
+# 同时按 bookworm 的包名更新：libgcc1 -> libgcc-s1，libappindicator3-1 -> libayatana-appindicator3-1。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        fontconfig \
+        fonts-liberation \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libayatana-appindicator3-1 \
+        libc6 \
+        libcairo2 \
+        libcups2 \
+        libdbus-1-3 \
+        libexpat1 \
+        libfontconfig1 \
+        libgbm1 \
+        libgcc-s1 \
+        libglib2.0-0 \
+        libgtk-3-0 \
+        libnspr4 \
+        libnss3 \
+        libnss3-dev \
+        libnss3-tools \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libstdc++6 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxcomposite1 \
+        libxcursor1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxi6 \
+        libxrandr2 \
+        libxrender1 \
+        libxss1 \
+        libxtst6 \
+        lsb-release \
+        wget \
+        xdg-utils \
+        xfonts-utils \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get install -y   ca-certificates \
-                                      fonts-liberation \
-                                      libappindicator3-1 \
-                                      libasound2 \
-                                      libatk-bridge2.0-0 \
-                                      libatk1.0-0 \
-                                      libc6 \
-                                      libcairo2 \
-                                      libcups2 \
-                                      libdbus-1-3 \
-                                      libexpat1 \
-                                      libfontconfig1 \
-                                      libgbm1 \
-                                      libgcc1 \
-                                      libglib2.0-0 \
-                                      libgtk-3-0 \
-                                      libnspr4 \
-                                      libnss3 \
-                                      libnss3-dev \
-                                       libnss3-tools \
-                                      libpango-1.0-0 \
-                                      libpangocairo-1.0-0 \
-                                      libstdc++6 \
-                                      libx11-6 \
-                                      libx11-xcb1 \
-                                      libxcb1 \
-                                      libxcomposite1 \
-                                      libxcursor1 \
-                                      libxdamage1 \
-                                      libxext6 \
-                                      libxfixes3 \
-                                      libxi6 \
-                                      libxrandr2 \
-                                      libxrender1 \
-                                      libxss1 \
-                                      libxtst6 \
-                                      lsb-release \
-                                      wget \
-                                      xdg-utils
-
-RUN apt-get install -y fontconfig xfonts-utils
 WORKDIR /app
 
 COPY fonts/* /usr/share/fonts/
