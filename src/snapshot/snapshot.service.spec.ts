@@ -189,7 +189,7 @@ describe('SnapshotService', () => {
     monitor.dispose();
   });
 
-  it('network monitor should throw when a request remains pending until deadline', async () => {
+  it('network monitor should ignore requests still pending when the deadline expires', async () => {
     const page = new EventEmitter();
     const request = {
       resourceType: () => 'xhr',
@@ -197,13 +197,338 @@ describe('SnapshotService', () => {
       url: () => 'https://example.com/api/attachment/1',
     };
     const monitor = (service as any).createUrlPdfNetworkMonitor(page);
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
 
     page.emit('request', request);
 
     await expect(
       (service as any).waitForUrlPdfNetworkSettled(monitor, Date.now() + 20, 5),
-    ).rejects.toThrow('仍有 1 个请求未结束');
+    ).resolves.toBeUndefined();
+
+    // 到期后请求被忽略，pending 清空，PDF 继续生成。
+    expect(monitor.pending.size).toBe(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('等待预算到期，忽略 1 个未结束的请求'),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('xhr=1'));
     monitor.dispose();
+  });
+
+  it('network monitor should keep ignoring requests that appear after the deadline', async () => {
+    const page = new EventEmitter();
+    const createRequest = () => ({
+      resourceType: () => 'fetch',
+      method: () => 'GET',
+      url: () => 'https://example.com/api/polling',
+    });
+    const monitor = (service as any).createUrlPdfNetworkMonitor(page);
+    const deadlineAt = Date.now() + 20;
+
+    page.emit('request', createRequest());
+    await (service as any).waitForUrlPdfNetworkSettled(monitor, deadlineAt, 5);
+
+    // 到期后页面又发起新请求：同样的调用应立即忽略并返回，不再阻塞。
+    page.emit('request', createRequest());
+    const startedAt = Date.now();
+    await expect(
+      (service as any).waitForUrlPdfNetworkSettled(monitor, deadlineAt, 5),
+    ).resolves.toBeUndefined();
+
+    expect(Date.now() - startedAt).toBeLessThan(60);
+    expect(monitor.pending.size).toBe(0);
+    monitor.dispose();
+  });
+
+  it('url/pdf media wait should be skipped when the budget already expired', async () => {
+    const page = { evaluate: jest.fn() };
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).waitUrlPdfMediaLoaded(
+        page,
+        1,
+        1,
+        Date.now() - 1,
+        '[page=1]',
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('跳过媒体等待'),
+    );
+  });
+
+  it('url/pdf media wait should ignore media failures when the budget expires during the wait', async () => {
+    const page = { evaluate: jest.fn() };
+    jest
+      .spyOn(service as any, 'waitMediaLoaded')
+      .mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        throw new Error('页面存在 1 个媒体资源加载失败');
+      });
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).waitUrlPdfMediaLoaded(
+        page,
+        1,
+        1,
+        Date.now() + 10,
+        '[page=1]',
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('忽略未就绪媒体资源'),
+    );
+  });
+
+  it('url/pdf media wait should keep strict failures when the budget is not used up', async () => {
+    const page = { evaluate: jest.fn() };
+    jest
+      .spyOn(service as any, 'waitMediaLoaded')
+      .mockRejectedValue(new Error('页面存在 1 个媒体资源加载失败'));
+
+    await expect(
+      (service as any).waitUrlPdfMediaLoaded(
+        page,
+        1,
+        1,
+        Date.now() + 5000,
+        '[page=1]',
+      ),
+    ).rejects.toThrow('页面存在 1 个媒体资源加载失败');
+  });
+
+  it('url/pdf media wait should include the failing media url in the strict error', async () => {
+    const page = {
+      evaluate: jest.fn().mockResolvedValue({
+        total: 1,
+        loaded: 0,
+        failed: [
+          {
+            type: 'image',
+            url: 'https://cdn.example.com/a.png?sig=secret',
+            reason: 'image-error',
+          },
+        ],
+      }),
+    };
+    jest
+      .spyOn(service as any, 'waitMediaLoaded')
+      .mockRejectedValue(new Error('页面存在 1 个媒体资源加载失败'));
+
+    const error: Error = await (service as any)
+      .waitUrlPdfMediaLoaded(page, 1, 1, Date.now() + 5000, '[page=1]')
+      .catch((e: Error) => e);
+
+    expect(error.message).toContain('页面存在 1 个媒体资源加载失败');
+    expect(error.message).toContain('image:image-error cdn.example.com/a.png');
+    // query 中的签名不进入报错信息。
+    expect(error.message).not.toContain('secret');
+  });
+
+  it('DOM stability check should be skipped when the budget already expired', async () => {
+    const page = { evaluate: jest.fn() };
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).waitForUrlPdfDomStable(page, Date.now() - 1, '[page=1]'),
+    ).resolves.toBeUndefined();
+
+    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('跳过 DOM 稳定性检查'),
+    );
+  });
+
+  it('visual settle should be skipped when the budget already expired', async () => {
+    const page = { bringToFront: jest.fn(), evaluate: jest.fn() };
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).waitForUrlPdfVisualSettled(
+        page,
+        Date.now() - 1,
+        '[page=1]',
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(page.bringToFront).not.toHaveBeenCalled();
+    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('跳过视觉渲染等待'),
+    );
+  });
+
+  it('url/pdf lazy scroll should be skipped when the budget already expired', async () => {
+    const page = { evaluate: jest.fn().mockResolvedValue(undefined) };
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).scrollPageForUrlPdfLazyResources(
+        page,
+        {
+          scrollTimes: 20,
+          minScrollTimes: 4,
+          scrollDelay: 1,
+          scrollOffset: 1000,
+        },
+        Date.now() - 1,
+        '[page=1]',
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(page.evaluate).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('跳过懒加载滚动'),
+    );
+  });
+
+  it('url/pdf lazy scroll should stop and reset position when the budget expires during scrolling', async () => {
+    const page = { evaluate: jest.fn().mockResolvedValue(undefined) };
+    jest
+      .spyOn(service as any, 'scrollPageForLazyResources')
+      .mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        throw new Error('页面资源等待超时');
+      });
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      (service as any).scrollPageForUrlPdfLazyResources(
+        page,
+        {
+          scrollTimes: 20,
+          minScrollTimes: 4,
+          scrollDelay: 1,
+          scrollOffset: 1000,
+        },
+        Date.now() + 10,
+        '[page=1]',
+      ),
+    ).resolves.toBeUndefined();
+
+    // 到期后停止滚动，只做滚动条归位。
+    expect(page.evaluate).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('停止懒加载滚动'),
+    );
+  });
+
+  it('url/pdf abort should stop network waiting immediately', async () => {
+    const page = new EventEmitter();
+    const monitor = (service as any).createUrlPdfNetworkMonitor(page);
+    page.emit('request', {
+      resourceType: () => 'xhr',
+      method: () => 'GET',
+      url: () => 'https://example.com/api/attachment/1',
+    });
+
+    const abortController = new AbortController();
+    (service as any).urlPdfAbortSignal = abortController.signal;
+    abortController.abort();
+
+    const startedAt = Date.now();
+    await expect(
+      (service as any).waitForUrlPdfNetworkSettled(
+        monitor,
+        Date.now() + 60000,
+        5,
+      ),
+    ).rejects.toThrow('客户端已断开，已停止生成 PDF');
+
+    // 不等待整页预算，立即退出。
+    expect(Date.now() - startedAt).toBeLessThan(50);
+    monitor.dispose();
+  });
+
+  it('urlToPdf should not start the browser when the client already aborted', async () => {
+    const abortController = new AbortController();
+    abortController.abort();
+    const initSpy = jest
+      .spyOn(service as any, 'init')
+      .mockResolvedValue(undefined);
+    const warnSpy = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      service.urlToPdf(
+        [{ url: 'https://example.com', name: 'report', option: {} }],
+        'zip',
+        abortController.signal,
+      ),
+    ).rejects.toThrow('客户端已断开，已停止生成 PDF');
+
+    expect(initSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('客户端已断开'),
+    );
+  });
+
+  it('urlToPdf should close the browser when the client aborts mid-batch', async () => {
+    const abortController = new AbortController();
+    const close = jest.fn().mockResolvedValue(undefined);
+    (service as any).browser = {
+      connected: true,
+      close,
+      newPage: jest.fn(),
+    };
+    jest.spyOn(service as any, 'init').mockResolvedValue(undefined);
+    // 模拟首个页面渲染途中客户端断开。
+    jest
+      .spyOn(service as any, 'renderUrlPdfItem')
+      .mockImplementation(async () => {
+        abortController.abort();
+        throw new Error('Target closed');
+      });
+
+    await expect(
+      service.urlToPdf(
+        [{ url: 'https://example.com', name: 'report', option: {} }],
+        'zip',
+        abortController.signal,
+      ),
+    ).rejects.toThrow('客户端已断开，已停止生成 PDF');
+
+    expect(close).toHaveBeenCalled();
+  });
+
+  it('renderUrlPdfItem should not retry when the client aborts during rendering', async () => {
+    const abortController = new AbortController();
+    (service as any).urlPdfAbortSignal = abortController.signal;
+    const renderOnceSpy = jest
+      .spyOn(service as any, 'renderUrlPdfItemOnce')
+      .mockImplementation(async () => {
+        abortController.abort();
+        throw new Error('Target closed');
+      });
+
+    await expect(
+      (service as any).renderUrlPdfItem(
+        { url: 'https://example.com', name: 'report', option: {} },
+        0,
+      ),
+    ).rejects.toThrow('客户端已断开，已停止生成 PDF');
+
+    // 断开后不再重试，只渲染了一次。
+    expect(renderOnceSpy).toHaveBeenCalledTimes(1);
   });
 
   it('network monitor should reject failed resources but allow a successful retry', () => {
@@ -226,6 +551,11 @@ describe('SnapshotService', () => {
     expect(() =>
       (service as any).assertUrlPdfNetworkSucceeded(monitor),
     ).toThrow('页面存在 1 个关键资源请求失败');
+
+    // 报错信息里带上失败资源的 URL（host + path，不含 query）。
+    expect(() =>
+      (service as any).assertUrlPdfNetworkSucceeded(monitor),
+    ).toThrow('xhr:GET example.com/api/attachment/1');
 
     const retriedRequest = createRequest();
     page.emit('request', retriedRequest);
@@ -265,7 +595,7 @@ describe('SnapshotService', () => {
   it('url PDF final gate should wait for network again after media and DOM checks', async () => {
     const monitor = {
       pending: new Set(),
-      failures: new Set(),
+      failures: new Map(),
       lastActivityAt: Date.now(),
       logLabel: '[urlToPdf][page=1][name=report]',
       dispose: jest.fn(),
@@ -474,6 +804,39 @@ describe('SnapshotService', () => {
 
     expect(summary).toContain('[URL已隐藏]');
     expect(summary).not.toContain('https://example.com');
+    expect(summary).not.toContain('secret');
+  });
+
+  it('url PDF failure error should keep the failing resource url readable after log scrubbing', () => {
+    const monitor = {
+      pending: new Set(),
+      failures: new Map([
+        [
+          'xhr:GET:https://app.example.com/api/report/1?token=secret',
+          {
+            resourceType: 'xhr',
+            method: 'GET',
+            url: 'https://app.example.com/api/report/1?token=secret',
+          },
+        ],
+      ]),
+      lastActivityAt: Date.now(),
+      logLabel: '[urlToPdf][page=1][name=report]',
+      dispose: jest.fn(),
+    };
+
+    let error: Error | undefined;
+    try {
+      (service as any).assertUrlPdfNetworkSucceeded(monitor);
+    } catch (e) {
+      error = e as Error;
+    }
+
+    expect(error?.message).toContain('xhr:GET app.example.com/api/report/1');
+
+    // 经过统一的 URL/token 脱敏后，资源标识仍然可读。
+    const summary = (service as any).getUrlPdfSafeErrorSummary(error);
+    expect(summary).toContain('app.example.com/api/report/1');
     expect(summary).not.toContain('secret');
   });
 
